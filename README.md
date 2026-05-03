@@ -10,8 +10,8 @@
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 *基于多智能体协作的科研全流程自动化系统*
-
 *基于 LangChain 框架构建，支持灵活的 LLM 切换*
+*原项目地址：[InnoCore AI](https://github.com/A-pricity/innocore-ai)*
 
 [English](README_EN.md) | 简体中文
 
@@ -297,7 +297,5 @@ python run.py
 <div align="center">
 
 **如果这个项目对你有帮助，请给一个 ⭐️ Star！**
-
-Made with ❤️ by InnoCore AI Team
 
 </div>
