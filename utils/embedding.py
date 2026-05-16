@@ -3,6 +3,7 @@ InnoCore AI 向量生成工具 - 基于 LangChain 框架
 """
 
 import asyncio
+import logging
 from typing import List, Dict, Optional, Any
 import numpy as np
 
@@ -13,8 +14,10 @@ from langchain_core.embeddings import Embeddings
 import hashlib
 import json
 
-from ..core.config import get_config
-from ..core.exceptions import AgentException
+from core.config import get_config
+from core.exceptions import AgentException
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingService:
@@ -29,22 +32,43 @@ class EmbeddingService:
     async def initialize(self):
         """初始化向量生成器"""
         try:
+            # 优先使用 Embedding 专用 API key（EMBEDDING_API_KEY）
+            # 如果没有，则降级到 LLM API key
+            embedding_api_key = self.config.vector_db.api_key or self.config.llm.api_key
+            embedding_base_url = getattr(self.config.vector_db, 'embedding_base_url', None)
+            
+            if not embedding_api_key:
+                raise AgentException(
+                    "未配置 Embedding API key。"
+                    "请在 .env 文件中设置 EMBEDDING_API_KEY 或 OPENAI_API_KEY"
+                )
+            
+            # 调试信息
+            api_key_source = "EMBEDDING_API_KEY" if self.config.vector_db.api_key else "OPENAI_API_KEY"
+            logger.info(f"Embedding 服务配置:")
+            logger.info(f"  - 模型: {self.embedding_model}")
+            logger.info(f"  - Base URL: {embedding_base_url or self.config.llm.base_url}")
+            logger.info(f"  - API Key 来源: {api_key_source}")
+            logger.info(f"  - API Key 前缀: {embedding_api_key[:10] if embedding_api_key else 'None'}...")
+            
             # 使用 LangChain OpenAIEmbeddings
             init_kwargs = {
                 "model": self.embedding_model,
-                "api_key": self.config.llm.api_key,
+                "api_key": embedding_api_key,
             }
             
             # 优先使用 Embedding 专用 base_url，否则使用 LLM 的 base_url
-            embedding_base_url = getattr(self.config.vector_db, 'embedding_base_url', None)
             if embedding_base_url:
                 init_kwargs["base_url"] = embedding_base_url
             elif self.config.llm.base_url:
                 init_kwargs["base_url"] = self.config.llm.base_url
             
+            logger.debug(f"OpenAIEmbeddings 初始化参数: {init_kwargs}")
             self.embeddings = OpenAIEmbeddings(**init_kwargs)
+            logger.info("Embedding 服务初始化成功")
             
         except Exception as e:
+            logger.error(f"向量生成器初始化失败: {str(e)}", exc_info=True)
             raise AgentException(f"向量生成器初始化失败: {str(e)}")
     
     async def generate_embedding(self, text: str, use_cache: bool = True) -> List[float]:
@@ -57,6 +81,14 @@ class EmbeddingService:
             cache_key = self._get_cache_key(text)
             if cache_key in self.cache:
                 return self.cache[cache_key]
+        
+        if not self.embeddings:
+            try:
+                await self.initialize()
+            except Exception as e:
+                print(f"嵌入服务初始化失败: {str(e)}")
+                # 返回零向量作为备选
+                return [0.0] * 1536
         
         try:
             # 清理文本
@@ -79,7 +111,12 @@ class EmbeddingService:
                                        batch_size: int = 10) -> List[List[float]]:
         """批量生成向量"""
         if not self.embeddings:
-            await self.initialize()
+            try:
+                await self.initialize()
+            except Exception as e:
+                print(f"嵌入服务初始化失败: {str(e)}")
+                # 返回零向量作为备选
+                return [[0.0] * 1536 for _ in texts]
         
         embeddings = []
         

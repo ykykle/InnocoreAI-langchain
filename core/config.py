@@ -82,7 +82,7 @@ class InnoCoreConfig:
     
     # 基础配置
     app_name: str = "InnoCore AI"
-    debug: bool = True
+    debug: bool = False
     log_level: str = "INFO"
     
     # LLM配置
@@ -137,7 +137,7 @@ class InnoCoreConfig:
         embedding_base_url = os.getenv("EMBEDDING_BASE_URL")
         if embedding_base_url:
             self.vector_db.embedding_base_url = embedding_base_url  # 新增字段
-
+        self.vector_db.api_key = os.getenv("EMBEDDING_API_KEY") or self.vector_db.api_key
         self.database.password = self.database.password or os.getenv("DATABASE_PASSWORD")
         self.redis.password = self.redis.password or os.getenv("REDIS_PASSWORD")
         

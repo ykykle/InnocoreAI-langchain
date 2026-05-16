@@ -5,6 +5,8 @@ InnoCore AI 向量存储管理模块 - 基于 LangChain 框架
 import asyncio
 from typing import List, Dict, Optional, Any, Tuple
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 # LangChain 向量存储组件
 from langchain_qdrant import QdrantVectorStore
@@ -28,22 +30,64 @@ class LangChainEmbeddings(Embeddings):
     
     def __init__(self, embedding_service):
         self.embedding_service = embedding_service
+        # 创建线程池用于运行异步操作
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="embedding_")
+    
+    def _run_async_in_thread(self, coro):
+        """在新线程中运行异步代码"""
+        def run_in_new_loop():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+        
+        # 在线程池中运行
+        future = self._executor.submit(run_in_new_loop)
+        return future.result(timeout=120)
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """批量嵌入文档"""
-        import asyncio
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.embedding_service.generate_batch_embeddings(texts)
-        )
+        try:
+            # 检查是否有事件循环在运行
+            try:
+                loop = asyncio.get_running_loop()
+                # 有事件循环在运行，使用线程池运行异步代码
+                return self._run_async_in_thread(
+                    self.embedding_service.generate_batch_embeddings(texts)
+                )
+            except RuntimeError:
+                # 没有事件循环在运行，直接运行
+                return asyncio.run(
+                    self.embedding_service.generate_batch_embeddings(texts)
+                )
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"批量嵌入失败: {str(e)}, 使用零向量")
+            return [[0.0] * 1536 for _ in texts]
     
     def embed_query(self, text: str) -> List[float]:
         """嵌入查询"""
-        import asyncio
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.embedding_service.generate_embedding(text)
-        )
+        try:
+            # 检查是否有事件循环在运行
+            try:
+                loop = asyncio.get_running_loop()
+                # 有事件循环在运行，使用线程池运行异步代码
+                return self._run_async_in_thread(
+                    self.embedding_service.generate_embedding(text)
+                )
+            except RuntimeError:
+                # 没有事件循环在运行，直接运行
+                return asyncio.run(
+                    self.embedding_service.generate_embedding(text)
+                )
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"查询嵌入失败: {str(e)}, 使用零向量")
+            return [0.0] * 1536
     
     async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
         """异步批量嵌入文档"""
@@ -74,20 +118,28 @@ class VectorStoreManager:
         """初始化向量数据库连接"""
         try:
             # 初始化 Qdrant 客户端
+            # 禁用 HTTPS 和版本检查以支持本地 HTTP 连接
             self.client = QdrantClient(
                 host=self.config.host,
                 port=self.config.port,
-                api_key=self.config.api_key
+                api_key=self.config.api_key,
+                prefer_grpc=False,  # 使用 HTTP REST API 而不是 gRPC
+                https=False,  # 明确指定不使用 HTTPS
+                check_compatibility=False  # 跳过版本检查
             )
             
-            # 创建集合
-            await self._create_collections()
-            
             # 设置嵌入服务
+            embedding_dimension = None
             if embedding_service:
                 self.embeddings = LangChainEmbeddings(embedding_service)
-                
-                # 初始化 LangChain 向量存储
+                # 获取实际的 embedding 维度
+                embedding_dimension = await self._get_embedding_dimension()
+            
+            # 创建集合（使用实际的 embedding 维度）
+            await self._create_collections(embedding_dimension)
+            
+            # 初始化 LangChain 向量存储
+            if embedding_service:
                 self._init_langchain_vectorstores()
             
         except Exception as e:
@@ -115,8 +167,26 @@ class VectorStoreManager:
         except Exception as e:
             raise VectorStoreException(f"LangChain 向量存储初始化失败: {str(e)}")
     
-    async def _create_collections(self):
+    async def _get_embedding_dimension(self) -> int:
+        """获取 embedding 的实际维度"""
+        if not self.embeddings:
+            return 1536  # 默认返回 OpenAI 维度
+        
+        try:
+            # 生成一个测试 embedding 来获取维度
+            test_embedding = await self.embeddings.aembed_query("test")
+            return len(test_embedding)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"无法获取 embedding 维度，使用默认值 1536: {str(e)}")
+            return 1536
+    
+    async def _create_collections(self, embedding_dimension: int = None):
         """创建向量集合"""
+        if embedding_dimension is None:
+            embedding_dimension = 1536  # 默认 OpenAI 维度
+        
         collections = [
             (self.l1_collection, "L1预置库"),
             (self.l2_collection, "L2用户库")
@@ -124,12 +194,39 @@ class VectorStoreManager:
         
         for collection_name, description in collections:
             try:
-                self.client.get_collection(collection_name)
-            except Exception:
+                # 检查集合是否已存在
+                existing_collection = self.client.get_collection(collection_name)
+                
+                # 检查维度是否匹配
+                existing_dim = existing_collection.config.params.vectors.size
+                if existing_dim != embedding_dimension:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(
+                        f"集合 {collection_name} 维度不匹配 "
+                        f"(现有: {existing_dim}, 新: {embedding_dimension})，"
+                        f"将删除并重新创建"
+                    )
+                    # 删除不匹配的集合
+                    self.client.delete_collection(collection_name)
+                    # 创建新集合
+                    self.client.create_collection(
+                        collection_name=collection_name,
+                        vectors_config=VectorParams(
+                            size=embedding_dimension,
+                            distance=Distance.COSINE
+                        )
+                    )
+                else:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.info(f"集合 {collection_name} 维度匹配，使用现有集合")
+            except Exception as e:
+                # 集合不存在，创建新集合
                 self.client.create_collection(
                     collection_name=collection_name,
                     vectors_config=VectorParams(
-                        size=1536,  # OpenAI embedding维度
+                        size=embedding_dimension,
                         distance=Distance.COSINE
                     )
                 )
@@ -334,7 +431,13 @@ class VectorStoreManager:
         if self.embeddings:
             return await self.embeddings.aembed_query(text)
         else:
-            # 降级为随机向量
+            # 警告：降级为随机向量（embedding_service 未初始化）
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "Embedding 服务未初始化，使用随机向量替代。"
+                "请确保调用 vector_store_manager.initialize(embedding_service=...) 时传入了 embedding_service 参数。"
+            )
             import random
             return [random.random() for _ in range(1536)]
     
@@ -409,6 +512,20 @@ class VectorStoreManager:
         """关闭向量数据库连接"""
         if self.client:
             self.client.close()
+    
+    def is_embedding_initialized(self) -> bool:
+        """检查 embedding 服务是否已初始化"""
+        return self.embeddings is not None
+    
+    def get_initialization_status(self) -> Dict[str, Any]:
+        """获取初始化状态诊断信息"""
+        return {
+            "qdrant_client_ready": self.client is not None,
+            "l1_vectorstore_ready": self.l1_vectorstore is not None,
+            "l2_vectorstore_ready": self.l2_vectorstore is not None,
+            "embedding_service_ready": self.embeddings is not None,
+            "embedding_service_type": type(self.embeddings).__name__ if self.embeddings else "None"
+        }
 
 
 # 全局向量存储管理器实例

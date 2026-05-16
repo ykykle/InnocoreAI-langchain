@@ -34,7 +34,12 @@ async def lifespan(app: FastAPI):
     
     # 初始化向量存储（可选）
     try:
-        await vector_store_manager.initialize()
+        from utils.embedding import get_embedding_service
+        embedding_service = get_embedding_service()
+        # 确保嵌入服务已初始化
+        if not embedding_service.embeddings:
+            await embedding_service.initialize()
+        await vector_store_manager.initialize(embedding_service=embedding_service)
         logger.info("向量存储初始化完成")
     except Exception as e:
         logger.warning(f"向量存储初始化失败（将以无向量存储模式运行）: {str(e)}")
