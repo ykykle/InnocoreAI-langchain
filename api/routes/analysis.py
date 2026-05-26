@@ -11,6 +11,7 @@ import os
 from core.config import get_config
 from core.llm_adapter import get_llm_adapter
 from utils.pdf_parser import pdf_parser
+from agents.controller import agent_controller, TaskType
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

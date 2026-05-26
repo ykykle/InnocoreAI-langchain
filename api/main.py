@@ -36,13 +36,20 @@ async def lifespan(app: FastAPI):
     try:
         from utils.embedding import get_embedding_service
         embedding_service = get_embedding_service()
-        # 确保嵌入服务已初始化
         if not embedding_service.embeddings:
             await embedding_service.initialize()
         await vector_store_manager.initialize(embedding_service=embedding_service)
         logger.info("向量存储初始化完成")
     except Exception as e:
         logger.warning(f"向量存储初始化失败（将以无向量存储模式运行）: {str(e)}")
+
+    # 初始化 Redis（可选）
+    try:
+        from core.redis_manager import redis_manager
+        await redis_manager.initialize()
+        logger.info("Redis 初始化完成")
+    except Exception as e:
+        logger.warning(f"Redis 初始化失败（将以无缓存模式运行）: {str(e)}")
     
     # 初始化智能体控制器（可选）
     try:
@@ -65,6 +72,11 @@ async def lifespan(app: FastAPI):
     await agent_controller.shutdown()
     await db_manager.close()
     await vector_store_manager.close()
+    try:
+        from core.redis_manager import redis_manager
+        await redis_manager.close()
+    except Exception:
+        pass
     logger.info("InnoCore AI已关闭")
 
 # 创建FastAPI应用

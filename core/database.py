@@ -2,16 +2,22 @@
 InnoCore AI 数据库管理模块
 """
 
-import asyncio
-import asyncpg
-from typing import Dict, List, Optional, Any, Union
-from datetime import datetime
 import json
-import uuid
+import logging
 from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional
+
+try:
+    import asyncpg
+    HAS_ASYNCPG = True
+except ImportError:
+    asyncpg = None
+    HAS_ASYNCPG = False
 
 from .config import get_config
 from .exceptions import DatabaseException
+
+logger = logging.getLogger(__name__)
 
 class DatabaseManager:
     """数据库管理器"""
@@ -22,6 +28,9 @@ class DatabaseManager:
     
     async def initialize(self):
         """初始化数据库连接池"""
+        if not HAS_ASYNCPG:
+            logger.warning("asyncpg 未安装，数据库功能不可用")
+            return
         try:
             self.pool = await asyncpg.create_pool(
                 host=self.config.host,
@@ -33,8 +42,9 @@ class DatabaseManager:
                 max_size=self.config.pool_size
             )
             await self._create_tables()
+            logger.info(f"PostgreSQL 初始化完成: {self.config.host}:{self.config.port}/{self.config.database}")
         except Exception as e:
-            raise DatabaseException(f"数据库初始化失败: {str(e)}")
+            logger.warning(f"数据库初始化失败（将以无数据库模式运行）: {str(e)}")
     
     async def _create_tables(self):
         """创建数据库表"""
@@ -93,6 +103,45 @@ class DatabaseManager:
             last_check TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         
+        -- Agent 执行日志表
+        CREATE TABLE IF NOT EXISTS agent_execution_logs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            agent_name VARCHAR(50) NOT NULL,
+            task_type VARCHAR(50),
+            task_id VARCHAR(100),
+            input_summary TEXT,
+            output_summary TEXT,
+            tools_called JSONB DEFAULT '[]',
+            status VARCHAR(20) DEFAULT 'running',
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            duration_ms INTEGER,
+            error_message TEXT
+        );
+
+        -- Agent 工具调用详情表
+        CREATE TABLE IF NOT EXISTS agent_tool_calls (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            execution_id UUID REFERENCES agent_execution_logs(id) ON DELETE CASCADE,
+            tool_name VARCHAR(100) NOT NULL,
+            tool_input JSONB,
+            tool_output JSONB,
+            called_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            duration_ms INTEGER
+        );
+
+        -- 工作流执行表
+        CREATE TABLE IF NOT EXISTS workflow_executions (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id UUID REFERENCES users(id),
+            workflow_type VARCHAR(50) NOT NULL,
+            status VARCHAR(20) DEFAULT 'running',
+            steps JSONB DEFAULT '[]',
+            result JSONB,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP
+        );
+
         -- 创建索引
         CREATE INDEX IF NOT EXISTS idx_papers_content_hash ON papers(content_hash);
         CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi);
@@ -100,6 +149,10 @@ class DatabaseManager:
         CREATE INDEX IF NOT EXISTS idx_user_paper_relations_paper_id ON user_paper_relations(paper_id);
         CREATE INDEX IF NOT EXISTS idx_analysis_reports_paper_id ON analysis_reports(paper_id);
         CREATE INDEX IF NOT EXISTS idx_analysis_reports_user_id ON analysis_reports(generated_for_user_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_logs_agent ON agent_execution_logs(agent_name);
+        CREATE INDEX IF NOT EXISTS idx_agent_logs_task_id ON agent_execution_logs(task_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_logs_status ON agent_execution_logs(status);
+        CREATE INDEX IF NOT EXISTS idx_workflow_status ON workflow_executions(status);
         """
         
         async with self.pool.acquire() as conn:
@@ -294,6 +347,89 @@ class DatabaseManager:
             )
             return dict(row) if row else None
     
+    # ---- Agent 执行日志 ----
+    async def log_agent_execution(
+        self, agent_name: str, task_type: str = None, task_id: str = None,
+        input_summary: str = None, status: str = "running"
+    ) -> str:
+        async with self.get_connection() as conn:
+            exec_id = await conn.fetchval(
+                """INSERT INTO agent_execution_logs
+                   (agent_name, task_type, task_id, input_summary, status)
+                   VALUES ($1, $2, $3, $4, $5) RETURNING id""",
+                agent_name, task_type, task_id, input_summary, status
+            )
+            return str(exec_id)
+
+    async def update_agent_execution(
+        self, execution_id: str, status: str, output_summary: str = None,
+        tools_called: List = None, duration_ms: int = None, error_message: str = None
+    ) -> bool:
+        async with self.get_connection() as conn:
+            result = await conn.execute(
+                """UPDATE agent_execution_logs
+                   SET status=$1, output_summary=$2, tools_called=$3,
+                       duration_ms=$4, error_message=$5, completed_at=CURRENT_TIMESTAMP
+                   WHERE id=$6""",
+                status, output_summary, json.dumps(tools_called or []),
+                duration_ms, error_message, execution_id
+            )
+            return result == "UPDATE 1"
+
+    async def log_tool_call(
+        self, execution_id: str, tool_name: str,
+        tool_input: Dict = None, tool_output: Any = None, duration_ms: int = None
+    ) -> str:
+        async with self.get_connection() as conn:
+            call_id = await conn.fetchval(
+                """INSERT INTO agent_tool_calls
+                   (execution_id, tool_name, tool_input, tool_output, duration_ms)
+                   VALUES ($1, $2, $3, $4, $5) RETURNING id""",
+                execution_id, tool_name,
+                json.dumps(tool_input or {}),
+                json.dumps(tool_output or {}, default=str),
+                duration_ms
+            )
+            return str(call_id)
+
+    # ---- 工作流执行 ----
+    async def create_workflow(self, user_id: str, workflow_type: str, steps: List = None) -> str:
+        async with self.get_connection() as conn:
+            wf_id = await conn.fetchval(
+                """INSERT INTO workflow_executions (user_id, workflow_type, steps)
+                   VALUES ($1, $2, $3) RETURNING id""",
+                user_id, workflow_type, json.dumps(steps or [])
+            )
+            return str(wf_id)
+
+    async def update_workflow(self, workflow_id: str, status: str, result: Dict = None) -> bool:
+        async with self.get_connection() as conn:
+            r = await conn.execute(
+                """UPDATE workflow_executions
+                   SET status=$1, result=$2, completed_at=CURRENT_TIMESTAMP
+                   WHERE id=$3""",
+                status, json.dumps(result or {}), workflow_id
+            )
+            return r == "UPDATE 1"
+
+    async def get_workflow(self, workflow_id: str) -> Optional[Dict]:
+        async with self.get_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM workflow_executions WHERE id = $1", workflow_id
+            )
+            return dict(row) if row else None
+
+    # ---- 数据库状态查询 ----
+    async def get_table_counts(self) -> Dict[str, int]:
+        tables = ["papers", "users", "user_paper_relations", "analysis_reports",
+                   "agent_execution_logs", "agent_tool_calls", "workflow_executions"]
+        counts = {}
+        async with self.get_connection() as conn:
+            for table in tables:
+                row = await conn.fetchrow(f"SELECT COUNT(*) as cnt FROM {table}")
+                counts[table] = row["cnt"] if row else 0
+        return counts
+
     async def close(self):
         """关闭数据库连接池"""
         if self.pool:

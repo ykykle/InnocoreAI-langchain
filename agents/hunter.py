@@ -107,7 +107,7 @@ class HunterAgent(BaseAgent):
         date_filter = ""
         if days_back > 0:
             start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y%m%d")
-            date_filter = f"submittedDate:[{start_filter}0000 TO {datetime.now().strftime('%Y%m%d')}2359]"
+            date_filter = f"submittedDate:[{start_date}0000 TO {datetime.now().strftime('%Y%m%d')}2359]"
         
         params = {
             "search_query": query,

@@ -9,10 +9,10 @@ import logging
 import json
 import asyncio
 
-# from ...agents.controller import agent_controller, TaskType
+from agents.controller import agent_controller, TaskType
 # 临时注释，避免相对导入错误
-agent_controller = None
-TaskType = None
+# agent_controller = None
+# TaskType = None
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
