@@ -18,7 +18,8 @@ from core.database import db_manager
 from core.exceptions import AgentException, ExternalAPIException
 from langchain_core.tools import tool
 from typing import Optional
-
+import logging
+logger = logging.getLogger(__name__)
 class HunterAgent(BaseAgent):
     """前哨探员智能体"""
     
@@ -117,8 +118,7 @@ class HunterAgent(BaseAgent):
             "sortOrder": "descending"
         }
         
-        import logging
-        logger = logging.getLogger(__name__)
+        
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -171,6 +171,7 @@ class HunterAgent(BaseAgent):
         config = self.config.external_apis
         
         if not config.ieee_base_url:
+            logger.warning("IEEE API配置缺失，跳过IEEE搜索")
             self._add_to_history("IEEE API配置缺失，跳过IEEE搜索")
             return papers
         

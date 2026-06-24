@@ -46,7 +46,8 @@ class VectorDBConfig:
     api_key: Optional[str] = None
     collection_name_prefix: str = "innocore"
     embedding_model: str = "text-embedding-3-small"
-    embedding_base_url: Optional[str] = None  # ✅ 新增这一行
+    embedding_base_url: Optional[str] = None
+    embedding_provider: str = "openai"  # "openai" | "local"
 
 @dataclass
 class DatabaseConfig:
@@ -136,7 +137,10 @@ class InnoCoreConfig:
         
         embedding_base_url = os.getenv("EMBEDDING_BASE_URL")
         if embedding_base_url:
-            self.vector_db.embedding_base_url = embedding_base_url  # 新增字段
+            self.vector_db.embedding_base_url = embedding_base_url
+        embedding_provider = os.getenv("EMBEDDING_PROVIDER")
+        if embedding_provider:
+            self.vector_db.embedding_provider = embedding_provider
         self.vector_db.api_key = os.getenv("EMBEDDING_API_KEY") or self.vector_db.api_key
         self.database.password = self.database.password or os.getenv("DATABASE_PASSWORD")
         self.redis.password = self.redis.password or os.getenv("REDIS_PASSWORD")
