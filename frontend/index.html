@@ -531,6 +531,12 @@
                 </div>
 
                 <div class="features">
+                    <div class="feature-card" onclick="activateAgent('realagent')" id="realagent-card"
+                        style="grid-column: 1 / -1; border-left-color: #16a085; background: #eefcf8;">
+                        <h3>🧠 RealAgent 自主研究助理</h3>
+                        <p>直接描述目标，由 LLM 自主决定调用哪些专业 Agent、工具及执行顺序。工作台实时展示决策进度。</p>
+                        <button class="btn" onclick="event.stopPropagation(); activateAgent('realagent')">自然语言对话</button>
+                    </div>
                     <div class="feature-card" onclick="activateAgent('workflow')" id="workflow-card"
                         style="display: none; grid-column: 1 / -1; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white;">
                         <h3>🔄 完整工作流</h3>
@@ -566,6 +572,18 @@
             </section>
 
             <!-- Hunter Agent 交互面板 -->
+            <div class="interaction-panel" id="realagent-panel">
+                <h3>🧠 RealAgent 自主工作台</h3>
+                <p style="color:#666;margin-bottom:16px">例如：“搜索 3 篇关于 LangGraph multi-agent 的新论文，比较创新点，并生成 BibTeX。”</p>
+                <div class="input-group">
+                    <label for="realagent-input">告诉系统你想完成什么</label>
+                    <textarea id="realagent-input" placeholder="请输入自然语言研究任务……"></textarea>
+                </div>
+                <button class="btn" id="realagent-send" onclick="executeRealAgent()">发送任务</button>
+                <div id="realagent-progress" style="margin-top:16px;padding:14px;background:#101827;color:#d1fae5;border-radius:8px;min-height:80px;font-family:Consolas,monospace;white-space:pre-wrap;max-height:260px;overflow:auto">等待任务</div>
+                <div class="response-area" id="realagent-response"></div>
+            </div>
+
             <div class="interaction-panel" id="hunter-panel">
                 <h3>🕵️ 文献搜索</h3>
                 <div class="input-group">
@@ -799,6 +817,44 @@
             currentAgent = agentType;
             document.getElementById(`${agentType}-card`).classList.add('active');
             document.getElementById(`${agentType}-panel`).classList.add('active');
+        }
+
+        async function executeRealAgent() {
+            const message = document.getElementById('realagent-input').value.trim();
+            const button = document.getElementById('realagent-send');
+            const progress = document.getElementById('realagent-progress');
+            if (!message) { showError('realagent-response', '请输入自然语言任务'); return; }
+            button.disabled = true;
+            progress.textContent = '正在提交任务……';
+            try {
+                const response = await fetch('/api/v1/agent/runs', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({message})
+                });
+                const run = await response.json();
+                if (!response.ok) throw new Error(run.detail || '任务提交失败');
+                await pollRealAgent(run.id);
+            } catch (error) { showError('realagent-response', error.message); }
+            finally { button.disabled = false; }
+        }
+
+        async function pollRealAgent(runId) {
+            const progress = document.getElementById('realagent-progress');
+            while (true) {
+                const response = await fetch(`/api/v1/agent/runs/${runId}`);
+                const run = await response.json();
+                if (!response.ok) throw new Error(run.detail || '无法读取任务状态');
+                progress.textContent = (run.events || []).map(event =>
+                    `[${new Date(event.time).toLocaleTimeString()}] ${event.type}: ${event.message}`
+                ).join('\n') || `状态: ${run.status}`;
+                progress.scrollTop = progress.scrollHeight;
+                if (run.status === 'completed') {
+                    showSuccess('realagent-response', 'RealAgent 已完成', {answer: run.answer, trace: run.events});
+                    return;
+                }
+                if (run.status === 'failed') throw new Error(run.error || '任务执行失败');
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
         }
 
         // 执行Hunter任务
