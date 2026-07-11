@@ -105,16 +105,54 @@ class EmbeddingService:
             logger.error(f"向量生成器初始化失败: {str(e)}", exc_info=True)
             raise AgentException(f"向量生成器初始化失败: {str(e)}")
 
+    @staticmethod
+    def _detect_device(config_device: Optional[str]) -> str:
+        """检测可用的 embedding 设备（自动优先 GPU）"""
+        # 1. 规范化：None / "auto" 均表示自动检测
+        if config_device is None or config_device.lower() == "auto":
+            config_device = None  # 走自动检测
+
+        # 2. 配置显式指定（EMBEDDING_DEVICE 环境变量）
+        if config_device:
+            if config_device.startswith("cuda"):
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        logger.info(f"GPU 可用: {torch.cuda.get_device_name(0)}")
+                        return config_device  # 支持 cuda, cuda:0 等
+                    else:
+                        logger.warning(f"配置要求 {config_device} 但 torch.cuda.is_available()=False，回退到 CPU")
+                        return "cpu"
+                except ImportError:
+                    logger.warning("未安装 torch，回退到 CPU")
+                    return "cpu"
+            return config_device  # 直接返回 "cpu", "mps" 等
+
+        # 3. 自动检测
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                logger.info(f"自动检测到 GPU: {gpu_name}，将使用 CUDA 加速")
+                return "cuda"
+        except ImportError:
+            pass
+
+        logger.info("未检测到 GPU，使用 CPU")
+        return "cpu"
+
     async def _init_local(self):
         """初始化本地 sentence-transformers 模型"""
+        device = self._detect_device(self.config.vector_db.embedding_device)
+
         logger.info(f"Embedding 服务: LOCAL 模式")
         logger.info(f"  - 模型: {self.embedding_model}")
-        logger.info(f"  - 设备: CPU (如需 GPU 加速请安装 CUDA 版 torch)")
+        logger.info(f"  - 设备: {device.upper()}" + (" (CUDA 加速)" if device == "cuda" else ""))
 
         # 在线程池中加载（避免阻塞事件循环）
         loop = asyncio.get_running_loop()
         self.embeddings = await loop.run_in_executor(
-            None, lambda: LocalEmbeddings(model_name=self.embedding_model, device="cpu")
+            None, lambda: LocalEmbeddings(model_name=self.embedding_model, device=device)
         )
         logger.info("本地 Embedding 服务初始化成功 ✓")
 

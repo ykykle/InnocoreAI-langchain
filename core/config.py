@@ -48,6 +48,7 @@ class VectorDBConfig:
     embedding_model: str = "text-embedding-3-small"
     embedding_base_url: Optional[str] = None
     embedding_provider: str = "openai"  # "openai" | "local"
+    embedding_device: Optional[str] = None  # None=auto, "cpu", "cuda"
 
 @dataclass
 class DatabaseConfig:
@@ -141,6 +142,9 @@ class InnoCoreConfig:
         embedding_provider = os.getenv("EMBEDDING_PROVIDER")
         if embedding_provider:
             self.vector_db.embedding_provider = embedding_provider
+        embedding_device = os.getenv("EMBEDDING_DEVICE")
+        if embedding_device:
+            self.vector_db.embedding_device = embedding_device
         self.vector_db.api_key = os.getenv("EMBEDDING_API_KEY") or self.vector_db.api_key
         self.database.password = self.database.password or os.getenv("DATABASE_PASSWORD")
         self.redis.password = self.redis.password or os.getenv("REDIS_PASSWORD")
