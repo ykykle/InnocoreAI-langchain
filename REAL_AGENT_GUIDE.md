@@ -52,6 +52,14 @@ Content-Type: application/json
 
 该冒烟测试刻意不调用外部检索工具，用于验证“配置加载 → LLM → LangGraph → 最终消息 → 事件轨迹”的主链路。论文检索、PDF 下载等外部服务仍受各服务网络和凭据状态影响。
 
+## 检索来源与失败降级
+
+RealAgent 的 Hunter 默认只使用无需密钥的 ArXiv。只有用户明确要求 IEEE 时，监督者才应传入 `sources: ["ieee"]` 或 `sources: ["arxiv", "ieee"]`。IEEE 需要在 `.env` 配置 `IEEE_API_KEY`。
+
+各检索来源相互隔离：某个来源失败或缺少凭据时，Hunter 会继续执行其他来源，并在结果的 `source_errors` 中说明跳过原因；已有的 ArXiv 结果不会因 IEEE 失败而丢失。`source_results` 展示各成功来源取得的条目数，`partial_success` 表示任务获得了部分结果但至少一个来源失败。
+
+前端进度区以时间线展示监督者规划、专业 Agent 调用、完成与失败；最终回答单独显示，不再把内部 trace 作为原始 JSON 混入答案。
+
 ## 扩展专业 Agent
 
 在 `agents/autonomous.py` 的工具列表注册 specialist tool，并在 `AgentController.agents` 提供实现。工具描述应明确适用场景和必需字段，专业 Agent 的 `run(input_data)` 应返回可 JSON 序列化结果并校验输入。

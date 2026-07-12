@@ -490,6 +490,17 @@
             margin: 12px 0;
             line-height: 1.8;
         }
+        .agent-timeline { margin-top: 16px; display: grid; gap: 10px; }
+        .agent-event { display: grid; grid-template-columns: 76px 18px 1fr; gap: 9px; align-items: start; }
+        .agent-event-time { color: #718096; font-size: 12px; padding-top: 3px; }
+        .agent-event-dot { width: 11px; height: 11px; margin-top: 5px; border-radius: 50%; background: #667eea; box-shadow: 0 0 0 4px #edf2ff; }
+        .agent-event.agent_started .agent-event-dot { background: #d69e2e; box-shadow: 0 0 0 4px #fff8df; }
+        .agent-event.agent_completed .agent-event-dot, .agent-event.completed .agent-event-dot { background: #2f855a; box-shadow: 0 0 0 4px #e6ffef; }
+        .agent-event.agent_failed .agent-event-dot, .agent-event.failed .agent-event-dot { background: #c53030; box-shadow: 0 0 0 4px #fff0f0; }
+        .agent-event-body { background: white; border: 1px solid #e2e8f0; padding: 9px 12px; border-radius: 8px; }
+        .agent-event-title { font-weight: 600; color: #2d3748; }
+        .agent-event-detail { color: #718096; font-size: 12px; margin-top: 3px; word-break: break-word; }
+        .agent-answer { margin-top: 16px; padding: 18px; background: white; border-left: 4px solid #2f855a; border-radius: 8px; white-space: pre-wrap; line-height: 1.75; }
     </style>
 </head>
 
@@ -580,7 +591,7 @@
                     <textarea id="realagent-input" placeholder="请输入自然语言研究任务……"></textarea>
                 </div>
                 <button class="btn" id="realagent-send" onclick="executeRealAgent()">发送任务</button>
-                <div id="realagent-progress" style="margin-top:16px;padding:14px;background:#101827;color:#d1fae5;border-radius:8px;min-height:80px;font-family:Consolas,monospace;white-space:pre-wrap;max-height:260px;overflow:auto">等待任务</div>
+                <div id="realagent-progress" class="agent-timeline"><div style="color:#718096">等待任务</div></div>
                 <div class="response-area" id="realagent-response"></div>
             </div>
 
@@ -844,17 +855,41 @@
                 const response = await fetch(`/api/v1/agent/runs/${runId}`);
                 const run = await response.json();
                 if (!response.ok) throw new Error(run.detail || '无法读取任务状态');
-                progress.textContent = (run.events || []).map(event =>
-                    `[${new Date(event.time).toLocaleTimeString()}] ${event.type}: ${event.message}`
-                ).join('\n') || `状态: ${run.status}`;
+                renderAgentTimeline(progress, run.events || [], run.status);
                 progress.scrollTop = progress.scrollHeight;
                 if (run.status === 'completed') {
-                    showSuccess('realagent-response', 'RealAgent 已完成', {answer: run.answer, trace: run.events});
+                    const answer = document.getElementById('realagent-response');
+                    answer.innerHTML = `<div class="result-header">RealAgent 最终回答</div><div class="agent-answer">${escapeHtml(run.answer || '任务已完成，但模型没有返回文本。')}</div>`;
                     return;
                 }
                 if (run.status === 'failed') throw new Error(run.error || '任务执行失败');
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
+        }
+
+        function renderAgentTimeline(container, events, status) {
+            const labels = {
+                planning: '正在规划', agent_started: '调用专业 Agent', agent_completed: 'Agent 执行完成',
+                agent_failed: 'Agent 执行失败', completed: '任务完成', failed: '任务失败'
+            };
+            if (!events.length) {
+                container.innerHTML = `<div style="color:#718096">状态：${escapeHtml(status)}</div>`;
+                return;
+            }
+            container.innerHTML = events.map(event => {
+                const detail = event.data?.instruction ? `任务：${event.data.instruction}` :
+                    (event.data?.agent ? `Agent：${event.data.agent}` : '');
+                return `<div class="agent-event ${escapeHtml(event.type)}">
+                    <div class="agent-event-time">${new Date(event.time).toLocaleTimeString()}</div>
+                    <div class="agent-event-dot"></div>
+                    <div class="agent-event-body"><div class="agent-event-title">${escapeHtml(labels[event.type] || event.type)}</div>
+                    <div>${escapeHtml(event.message || '')}</div>${detail ? `<div class="agent-event-detail">${escapeHtml(detail)}</div>` : ''}</div>
+                </div>`;
+            }).join('');
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
         }
 
         // 执行Hunter任务

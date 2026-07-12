@@ -66,7 +66,11 @@ class AutonomousResearchGraph:
                 payload.setdefault("instruction", instruction)
                 payload.setdefault("request", instruction)
                 # Adapt conversational vocabulary to the stable specialist APIs.
-                if name == "coach":
+                if name == "hunter":
+                    payload.setdefault("sources", ["arxiv"])
+                    payload.setdefault("max_papers", 5)
+                    payload.setdefault("days_back", 30)
+                elif name == "coach":
                     payload.setdefault("user_id", "anonymous")
                     payload.setdefault("content", payload.get("text", instruction))
                     payload.setdefault("task_type", payload.get("task", "polish"))
@@ -88,7 +92,7 @@ class AutonomousResearchGraph:
             )
 
         tools = [
-            specialist_tool("hunter", "Search and collect research papers. context requires keywords (list), and may include max_papers, sources, days_back."),
+            specialist_tool("hunter", "Search papers. ArXiv is always available and the default. IEEE is optional: include it in context.sources only when explicitly requested. context requires keywords (list), and may include max_papers, sources, days_back. Source failures are isolated in source_errors."),
             specialist_tool("miner", "Read and deeply analyse one paper. context should contain paper_id, paper_url, or title plus abstract."),
             specialist_tool("validator", "Verify metadata and generate citations. context requires paper_info and may contain formats."),
             specialist_tool("coach", "Explain concepts, polish text, or draft research writing. context should contain text, task, and optional style."),
@@ -101,7 +105,8 @@ class AutonomousResearchGraph:
                 "You are InnoCore's autonomous research supervisor. Understand the user's natural-language goal, "
                 "then independently choose specialist agents and their order. There is no mandatory pipeline. "
                 "Reuse tool results as context for later tools. Never invent tool results. If an agent reports an "
-                "error, adapt or explain it. Ask for clarification only when essential. End with a concise Chinese "
+                "error, change parameters or capability; never repeat an identical failing call. For literature "
+                "search use ArXiv unless IEEE was explicitly requested. Ask for clarification only when essential. End with a concise Chinese "
                 "answer describing what was done and the useful result."
             ),
             checkpointer=self.checkpointer,

@@ -51,15 +51,31 @@ class HunterAgent(BaseAgent):
             days_back = input_data.get("days_back", 1)
             
             all_papers = []
+            source_results = {}
+            source_errors = {}
             
             # 搜索不同来源
             if "arxiv" in sources:
-                arxiv_papers = await self._search_papers_from_arxiv(keywords, max_papers, days_back)
-                all_papers.extend(arxiv_papers)
+                try:
+                    arxiv_papers = await self._search_papers_from_arxiv(keywords, max_papers, days_back)
+                    all_papers.extend(arxiv_papers)
+                    source_results["arxiv"] = len(arxiv_papers)
+                except Exception as exc:
+                    source_errors["arxiv"] = str(exc)
+                    logger.warning("ArXiv source failed; continuing: %s", exc)
             
             if "ieee" in sources:
-                ieee_papers = await self._search_papers_from_ieee(keywords, max_papers, days_back)
-                all_papers.extend(ieee_papers)
+                if not self.config.external_apis.ieee_api_key:
+                    source_errors["ieee"] = "IEEE_API_KEY is not configured; IEEE was skipped"
+                    logger.warning("IEEE_API_KEY is not configured; continuing with other sources")
+                else:
+                    try:
+                        ieee_papers = await self._search_papers_from_ieee(keywords, max_papers, days_back)
+                        all_papers.extend(ieee_papers)
+                        source_results["ieee"] = len(ieee_papers)
+                    except Exception as exc:
+                        source_errors["ieee"] = str(exc)
+                        logger.warning("IEEE source failed; continuing: %s", exc)
             
             # 去重和筛选
             unique_papers = self._deduplicate_papers(all_papers)
@@ -83,7 +99,10 @@ class HunterAgent(BaseAgent):
                 "unique_papers": len(unique_papers),
                 "filtered_papers": len(filtered_papers),
                 "downloaded_papers": len(downloaded_papers),
-                "papers": downloaded_papers
+                "papers": downloaded_papers,
+                "source_results": source_results,
+                "source_errors": source_errors,
+                "partial_success": bool(source_errors) and bool(all_papers)
             }
             
         except Exception as e:
@@ -170,7 +189,7 @@ class HunterAgent(BaseAgent):
         # IEEE API需要API key，这里提供基础实现框架
         config = self.config.external_apis
         
-        if not config.ieee_base_url:
+        if not config.ieee_base_url or not config.ieee_api_key:
             logger.warning("IEEE API配置缺失，跳过IEEE搜索")
             self._add_to_history("IEEE API配置缺失，跳过IEEE搜索")
             return papers
