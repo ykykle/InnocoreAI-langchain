@@ -157,6 +157,8 @@ class InnoCoreConfig:
         
         self.debug = os.getenv("DEBUG", "false").lower() == "true"
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
+        self.agent_timeout = int(os.getenv("AGENT_TIMEOUT", str(self.agent_timeout)))
+        self.agent_max_steps = int(os.getenv("AGENT_MAX_STEPS", str(self.agent_max_steps)))
 
 # 全局配置实例
 config = InnoCoreConfig()

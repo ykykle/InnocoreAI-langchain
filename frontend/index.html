@@ -869,16 +869,23 @@
 
         function renderAgentTimeline(container, events, status) {
             const labels = {
-                planning: '正在规划', agent_started: '调用专业 Agent', agent_completed: 'Agent 执行完成',
-                agent_failed: 'Agent 执行失败', completed: '任务完成', failed: '任务失败'
+                planning: '正在规划', decision: 'LLM 决策', agent_started: '调用专业 Agent',
+                agent_progress: 'Agent 内部进度', duplicate_skipped: '跳过重复调用',
+                agent_completed: 'Agent 执行完成', agent_failed: 'Agent 执行失败', completed: '任务完成', failed: '任务失败'
             };
             if (!events.length) {
                 container.innerHTML = `<div style="color:#718096">状态：${escapeHtml(status)}</div>`;
                 return;
             }
             container.innerHTML = events.map(event => {
-                const detail = event.data?.instruction ? `任务：${event.data.instruction}` :
-                    (event.data?.agent ? `Agent：${event.data.agent}` : '');
+                const details = [];
+                if (event.data?.agent) details.push(`Agent：${event.data.agent}`);
+                if (event.data?.function) details.push(`函数：${event.data.function}`);
+                if (event.data?.stage) details.push(`阶段：${event.data.stage}`);
+                if (event.data?.instruction) details.push(`决策任务：${event.data.instruction}`);
+                if (event.data?.elapsed_seconds !== undefined) details.push(`耗时：${event.data.elapsed_seconds}s`);
+                if (event.data?.current !== undefined && event.data?.total !== undefined) details.push(`进度：${event.data.current}/${event.data.total}`);
+                const detail = details.join(' ｜ ');
                 return `<div class="agent-event ${escapeHtml(event.type)}">
                     <div class="agent-event-time">${new Date(event.time).toLocaleTimeString()}</div>
                     <div class="agent-event-dot"></div>

@@ -8,6 +8,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
+from contextvars import ContextVar
 from typing import Any, Callable, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -20,6 +21,7 @@ from core.exceptions import AgentException, TimeoutException
 from core.llm_adapter import get_llm_adapter
 
 logger = logging.getLogger(__name__)
+_agent_progress_callback: ContextVar = ContextVar("agent_progress_callback", default=None)
 
 
 class BaseAgent(ABC):
@@ -188,6 +190,19 @@ class BaseAgent(ABC):
     def set_state(self, state: str):
         self.state = state
         logger.info(f"Agent {self.name} state: {state}")
+
+    async def emit_progress(self, stage: str, message: str, **data):
+        """Emit optional fine-grained progress to the supervising graph."""
+        logger.info("Agent %s progress [%s]: %s", self.name, stage, message)
+        callback = _agent_progress_callback.get()
+        if callback:
+            await callback(stage, message, data)
+
+    def set_progress_callback(self, callback):
+        return _agent_progress_callback.set(callback)
+
+    def reset_progress_callback(self, token):
+        _agent_progress_callback.reset(token)
 
     def get_status(self) -> Dict[str, Any]:
         return {

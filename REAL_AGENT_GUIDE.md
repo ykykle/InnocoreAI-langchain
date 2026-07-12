@@ -60,6 +60,12 @@ RealAgent 的 Hunter 默认只使用无需密钥的 ArXiv。只有用户明确�
 
 前端进度区以时间线展示监督者规划、专业 Agent 调用、完成与失败；最终回答单独显示，不再把内部 trace 作为原始 JSON 混入答案。
 
+### 开发进度与超时
+
+RealAgent 事件流会展示 `decision`（LLM 选择的 Agent、函数和任务）、`agent_progress`（专业 Agent 内部函数与阶段）、`agent_completed/agent_failed`（含耗时）以及 `duplicate_skipped`（相同参数的重复调用被跳过）。后端日志同步输出结构化 `data`，长摘要和正文只记录长度，不打印全文。
+
+监督者调用专业 Agent 时统一应用 `AGENT_TIMEOUT` 对应的 `agent_timeout`（当前默认 300 秒）。Hunter 会报告来源检索、去重筛选以及逐篇 PDF 处理进度。完全相同的 Agent 输入在同一次请求内只执行一次，避免模型重复消耗外部 API 和下载时间。
+
 ## 论文标识约定
 
 跨 Agent 传递论文时必须区分数据库标识与来源标识：`db_id` 是 PostgreSQL UUID；`external_id` 是 `2606.01899v1` 这样的 ArXiv ID 或 IEEE 平台 ID；`source` 表示来源。Hunter 会为每篇论文返回可直接交给 Miner 的 `analysis_input`。

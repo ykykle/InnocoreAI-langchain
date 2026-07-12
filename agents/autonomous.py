@@ -7,6 +7,8 @@ complete. Specialist agents remain independently testable modules.
 
 import json
 import logging
+import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -46,6 +48,7 @@ class AutonomousResearchGraph:
         on_progress: Optional[ProgressCallback] = None,
     ) -> Dict[str, Any]:
         traces: List[Dict[str, Any]] = []
+        seen_calls = set()
 
         async def emit(kind: str, message: str, data: Optional[Dict[str, Any]] = None):
             event = {
@@ -55,13 +58,12 @@ class AutonomousResearchGraph:
                 "data": data or {},
             }
             traces.append(event)
-            logger.info("[real-agent:%s] %s | %s", thread_id, kind, message)
+            logger.info("[real-agent:%s] %s | %s | data=%s", thread_id, kind, message, json.dumps(data or {}, ensure_ascii=False, default=str)[:1000])
             if on_progress:
                 await on_progress(kind, message, data or {})
 
         def specialist_tool(name: str, description: str) -> StructuredTool:
             async def delegate(instruction: str, context: Dict[str, Any] = None) -> str:
-                await emit("agent_started", f"{name} accepted an assignment", {"agent": name, "instruction": instruction})
                 payload = dict(context or {})
                 payload.setdefault("instruction", instruction)
                 payload.setdefault("request", instruction)
@@ -82,13 +84,36 @@ class AutonomousResearchGraph:
                     payload.setdefault("task_type", payload.get("task", "polish"))
                 elif name == "validator" and "citation" in payload:
                     payload.setdefault("citation_text", payload["citation"])
+                call_signature = json.dumps({"agent": name, "payload": payload}, sort_keys=True, ensure_ascii=False, default=str)
+                if call_signature in seen_calls:
+                    await emit("duplicate_skipped", f"跳过重复的 {name} 调用", {"agent": name, "function": f"{name}.run", "instruction": instruction})
+                    return json.dumps({"error": "duplicate_call_skipped", "agent": name, "guidance": "Use previous result or change parameters."}, ensure_ascii=False)
+                seen_calls.add(call_signature)
+                await emit("decision", f"LLM 决定调用 {name}", {"agent": name, "function": f"{name}.run", "instruction": instruction, "input": self._summarize_payload(payload)})
+                await emit("agent_started", f"{name} accepted an assignment", {"agent": name, "function": f"{name}.run", "instruction": instruction})
+                started = time.monotonic()
+
+                async def specialist_progress(stage: str, message: str, data: Dict[str, Any]):
+                    await emit("agent_progress", message, {"agent": name, "stage": stage, **data})
+
+                agent = self.agents[name]
+                token = agent.set_progress_callback(specialist_progress)
                 try:
-                    result = await self.agents[name].run(payload)
-                    await emit("agent_completed", f"{name} completed its assignment", {"agent": name})
+                    result = await asyncio.wait_for(agent.run(payload), timeout=agent.timeout)
+                    elapsed = round(time.monotonic() - started, 2)
+                    await emit("agent_completed", f"{name} completed its assignment", {"agent": name, "function": f"{name}.run", "elapsed_seconds": elapsed})
                     return json.dumps(result, ensure_ascii=False, default=str)
+                except asyncio.TimeoutError:
+                    elapsed = round(time.monotonic() - started, 2)
+                    message = f"{name} timed out after {agent.timeout}s"
+                    await emit("agent_failed", message, {"agent": name, "function": f"{name}.run", "elapsed_seconds": elapsed, "timeout_seconds": agent.timeout})
+                    return json.dumps({"error": message, "agent": name}, ensure_ascii=False)
                 except Exception as exc:
-                    await emit("agent_failed", f"{name} failed: {exc}", {"agent": name})
+                    elapsed = round(time.monotonic() - started, 2)
+                    await emit("agent_failed", f"{name} failed: {exc}", {"agent": name, "function": f"{name}.run", "elapsed_seconds": elapsed})
                     return json.dumps({"error": str(exc), "agent": name}, ensure_ascii=False)
+                finally:
+                    agent.reset_progress_callback(token)
 
             return StructuredTool.from_function(
                 coroutine=delegate,
@@ -129,3 +154,16 @@ class AutonomousResearchGraph:
         answer = next((m.content for m in reversed(messages) if getattr(m, "type", "") == "ai" and m.content), "")
         await emit("completed", "LLM supervisor completed the request")
         return {"answer": answer, "trace": traces, "thread_id": thread_id}
+
+    @staticmethod
+    def _summarize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep decisions inspectable without flooding logs with paper bodies."""
+        summary = {}
+        for key, value in payload.items():
+            if key in {"abstract", "full_text", "content", "text"}:
+                summary[key] = f"<{len(str(value))} chars>"
+            elif isinstance(value, list) and len(value) > 10:
+                summary[key] = f"<{len(value)} items>"
+            else:
+                summary[key] = value
+        return summary
