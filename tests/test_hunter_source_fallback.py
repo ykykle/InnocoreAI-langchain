@@ -20,20 +20,22 @@ class HunterFallbackTest(unittest.TestCase):
                 "authors": [], "pdf_url": "https://example.test/paper.pdf", "source": "arxiv",
             }]
 
-        async def fake_download(paper):
-            return paper
+        async def fake_download(_paper):
+            return None
 
         token = hunter.set_progress_callback(progress)
         try:
             with patch.object(hunter, "_search_papers_from_arxiv", fake_arxiv), \
                     patch.object(hunter, "_download_and_save_paper", fake_download):
                 result = asyncio.run(hunter.run({
-                    "keywords": ["agent systems"], "sources": ["arxiv", "ieee"], "max_papers": 1,
+                    "keywords": ["agent systems"], "sources": ["ArXiv", "IEEE"], "max_papers": 1,
                 }))
         finally:
             hunter.reset_progress_callback(token)
 
         self.assertEqual(len(result["papers"]), 1)
+        self.assertEqual(result["downloaded_papers"], 0)
+        self.assertEqual(result["papers"][0]["external_id"], "paper-1")
         self.assertEqual(result["source_results"], {"arxiv": 1})
         self.assertIn("IEEE_API_KEY", result["source_errors"]["ieee"])
         self.assertTrue(result["partial_success"])

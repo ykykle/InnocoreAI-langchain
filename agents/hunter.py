@@ -47,7 +47,7 @@ class HunterAgent(BaseAgent):
         try:
             keywords = input_data["keywords"]
             max_papers = input_data.get("max_papers", 20)
-            sources = input_data.get("sources", ["arxiv", "ieee"])
+            sources = [str(source).strip().lower() for source in input_data.get("sources", ["arxiv", "ieee"])]
             days_back = input_data.get("days_back", 1)
             
             all_papers = []
@@ -109,6 +109,20 @@ class HunterAgent(BaseAgent):
                     await self.emit_progress("download", f"PDF 处理完成 {index}/{len(selected_papers)}", function="_download_and_save_paper", current=index, total=len(selected_papers))
                 except Exception as e:
                     self._add_to_history(f"下载论文失败 {paper.get('title', 'Unknown')}: {str(e)}")
+
+            # Search metadata is valid evidence even when a PDF cannot be
+            # downloaded. Always expose a stable hand-off to downstream agents.
+            for paper in selected_papers:
+                paper.setdefault("external_id", paper.get("id"))
+                paper["analysis_input"] = {
+                    "db_id": paper.get("db_id"),
+                    "external_id": paper.get("external_id"),
+                    "source": paper.get("source"),
+                    "paper_url": paper.get("pdf_url"),
+                    "title": paper.get("title", ""),
+                    "abstract": paper.get("abstract", ""),
+                    "authors": paper.get("authors", []),
+                }
             
             self.set_state("completed")
             
@@ -118,7 +132,7 @@ class HunterAgent(BaseAgent):
                 "unique_papers": len(unique_papers),
                 "filtered_papers": len(filtered_papers),
                 "downloaded_papers": len(downloaded_papers),
-                "papers": downloaded_papers,
+                "papers": selected_papers,
                 "source_results": source_results,
                 "source_errors": source_errors,
                 "partial_success": bool(source_errors) and bool(all_papers)

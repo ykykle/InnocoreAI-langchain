@@ -72,6 +72,14 @@ RealAgent 事件流会展示 `decision`（LLM 选择的 Agent、函数和任务�
 
 Miner 会先校验数据库 ID。非 UUID 的旧版 `paper_id` 不再进入 PostgreSQL，而会按 ArXiv 外部 ID 解析；分析报告和向量索引也只会使用合法 UUID 写入数据库。新代码应优先原样传递 `analysis_input`，不要把 `external_id` 改名为 `db_id`。
 
+## 真实证据门控
+
+检索来源名称不区分大小写，`ArXiv`、`arxiv` 均会实际调用 ArXiv API。Hunter 返回的论文元数据来自外部 API；即使 PDF 下载失败，标题、作者、摘要、来源和外部 ID 仍作为检索证据返回，并单独记录下载数量。
+
+监督者只允许使用 Hunter 返回的论文事实。如果本次调用过 Hunter 但没有取得任何带标题和外部 ID 的真实论文，最终的模型文本会被确定性证据门控替换为“未获得可验证的论文结果”，同时产生 `evidence_blocked` 事件。系统不会再使用模型记忆虚构论文标题、摘要、方法或创新点。成功检索会产生 `evidence` 事件及论文数量。
+
+RealAgent 最终回答使用前端内置的 Markdown 渲染器展示，支持标题、列表、粗体、斜体、行内代码和链接，不再显示未经渲染的 Markdown 原文。
+
 ## 扩展专业 Agent
 
 在 `agents/autonomous.py` 的工具列表注册 specialist tool，并在 `AgentController.agents` 提供实现。工具描述应明确适用场景和必需字段，专业 Agent 的 `run(input_data)` 应返回可 JSON 序列化结果并校验输入。

@@ -49,6 +49,8 @@ class AutonomousResearchGraph:
     ) -> Dict[str, Any]:
         traces: List[Dict[str, Any]] = []
         seen_calls = set()
+        evidence_papers: Dict[str, Dict[str, Any]] = {}
+        hunter_attempted = False
 
         async def emit(kind: str, message: str, data: Optional[Dict[str, Any]] = None):
             event = {
@@ -64,11 +66,13 @@ class AutonomousResearchGraph:
 
         def specialist_tool(name: str, description: str) -> StructuredTool:
             async def delegate(instruction: str, context: Dict[str, Any] = None) -> str:
+                nonlocal hunter_attempted
                 payload = dict(context or {})
                 payload.setdefault("instruction", instruction)
                 payload.setdefault("request", instruction)
                 # Adapt conversational vocabulary to the stable specialist APIs.
                 if name == "hunter":
+                    hunter_attempted = True
                     payload.setdefault("sources", ["arxiv"])
                     payload.setdefault("max_papers", 5)
                     payload.setdefault("days_back", 30)
@@ -100,6 +104,12 @@ class AutonomousResearchGraph:
                 token = agent.set_progress_callback(specialist_progress)
                 try:
                     result = await asyncio.wait_for(agent.run(payload), timeout=agent.timeout)
+                    if name == "hunter":
+                        for paper in result.get("papers", []):
+                            evidence_id = str(paper.get("external_id") or paper.get("id") or paper.get("doi") or "")
+                            if evidence_id and paper.get("title"):
+                                evidence_papers[evidence_id] = paper
+                        await emit("evidence", f"已收集 {len(evidence_papers)} 篇真实论文证据", {"agent": name, "count": len(evidence_papers), "paper_ids": list(evidence_papers)[:20]})
                     elapsed = round(time.monotonic() - started, 2)
                     await emit("agent_completed", f"{name} completed its assignment", {"agent": name, "function": f"{name}.run", "elapsed_seconds": elapsed})
                     return json.dumps(result, ensure_ascii=False, default=str)
@@ -135,7 +145,9 @@ class AutonomousResearchGraph:
             prompt=(
                 "You are InnoCore's autonomous research supervisor. Understand the user's natural-language goal, "
                 "then independently choose specialist agents and their order. There is no mandatory pipeline. "
-                "Reuse tool results as context for later tools. Never invent tool results. If an agent reports an "
+                "Reuse tool results as context for later tools. PAPER FACTS MUST COME FROM hunter tool results only. "
+                "Never invent paper titles, authors, abstracts, identifiers, methods, citations, or findings. If Hunter returns zero papers, "
+                "state that no verified evidence was retrieved and do not ask Miner or Coach to fabricate substitutes. If an agent reports an "
                 "error, change parameters or capability; never repeat an identical failing call. For literature "
                 "search use ArXiv unless IEEE was explicitly requested. Ask for clarification only when essential. End with a concise Chinese "
                 "answer describing what was done and the useful result."
@@ -152,8 +164,11 @@ class AutonomousResearchGraph:
         )
         messages = result.get("messages", [])
         answer = next((m.content for m in reversed(messages) if getattr(m, "type", "") == "ai" and m.content), "")
+        answer, evidence_blocked = self._apply_evidence_gate(answer, hunter_attempted, evidence_papers)
+        if evidence_blocked:
+            await emit("evidence_blocked", "零论文证据，已阻止无依据回答", {"paper_count": 0})
         await emit("completed", "LLM supervisor completed the request")
-        return {"answer": answer, "trace": traces, "thread_id": thread_id}
+        return {"answer": answer, "trace": traces, "thread_id": thread_id, "evidence": {"paper_count": len(evidence_papers), "papers": list(evidence_papers.values())}}
 
     @staticmethod
     def _summarize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -167,3 +182,15 @@ class AutonomousResearchGraph:
             else:
                 summary[key] = value
         return summary
+
+    @staticmethod
+    def _apply_evidence_gate(answer: str, hunter_attempted: bool, evidence_papers: Dict[str, Any]):
+        if hunter_attempted and not evidence_papers:
+            return (
+                "## 未获得可验证的论文结果\n\n"
+                "本次请求已调用论文检索工具，但没有从 ArXiv/IEEE 返回可验证的论文元数据。"
+                "为避免生成不可靠的论文标题、摘要或创新点，系统已阻止基于模型记忆继续作答。\n\n"
+                "请检查检索来源网络状态、关键词、时间范围和 API 配置后重试。",
+                True,
+            )
+        return answer, False

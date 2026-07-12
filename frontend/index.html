@@ -859,7 +859,7 @@
                 progress.scrollTop = progress.scrollHeight;
                 if (run.status === 'completed') {
                     const answer = document.getElementById('realagent-response');
-                    answer.innerHTML = `<div class="result-header">RealAgent 最终回答</div><div class="agent-answer">${escapeHtml(run.answer || '任务已完成，但模型没有返回文本。')}</div>`;
+                    answer.innerHTML = `<div class="result-header">RealAgent 最终回答</div><div class="agent-answer markdown-content">${renderMarkdown(run.answer || '任务已完成，但模型没有返回文本。')}</div>`;
                     return;
                 }
                 if (run.status === 'failed') throw new Error(run.error || '任务执行失败');
@@ -871,6 +871,7 @@
             const labels = {
                 planning: '正在规划', decision: 'LLM 决策', agent_started: '调用专业 Agent',
                 agent_progress: 'Agent 内部进度', duplicate_skipped: '跳过重复调用',
+                evidence: '论文证据', evidence_blocked: '证据门控',
                 agent_completed: 'Agent 执行完成', agent_failed: 'Agent 执行失败', completed: '任务完成', failed: '任务失败'
             };
             if (!events.length) {
