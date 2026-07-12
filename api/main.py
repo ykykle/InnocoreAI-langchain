@@ -164,7 +164,11 @@ async def root():
     """根路径 - 返回前端首页"""
     index_path = os.path.join(FRONTEND_DIR, "index.html")
     if os.path.exists(index_path):
-        return FileResponse(index_path)
+        return FileResponse(index_path, headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        })
     return {
         "message": "Welcome to InnoCore AI API",
         "version": "0.1.0",

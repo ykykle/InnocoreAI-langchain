@@ -500,7 +500,9 @@
         .agent-event-body { background: white; border: 1px solid #e2e8f0; padding: 9px 12px; border-radius: 8px; }
         .agent-event-title { font-weight: 600; color: #2d3748; }
         .agent-event-detail { color: #718096; font-size: 12px; margin-top: 3px; word-break: break-word; }
-        .agent-answer { margin-top: 16px; padding: 18px; background: white; border-left: 4px solid #2f855a; border-radius: 8px; white-space: pre-wrap; line-height: 1.75; }
+        .agent-answer { margin-top: 16px; padding: 18px; background: white; border-left: 4px solid #2f855a; border-radius: 8px; line-height: 1.75; }
+        .agent-answer > :first-child { margin-top: 0 !important; }
+        .agent-answer > :last-child { margin-bottom: 0 !important; }
     </style>
 </head>
 
@@ -859,7 +861,7 @@
                 progress.scrollTop = progress.scrollHeight;
                 if (run.status === 'completed') {
                     const answer = document.getElementById('realagent-response');
-                    answer.innerHTML = `<div class="result-header">RealAgent 最终回答</div><div class="agent-answer markdown-content">${renderMarkdown(run.answer || '任务已完成，但模型没有返回文本。')}</div>`;
+                    answer.innerHTML = `<div class="result-header">RealAgent 最终回答</div><div class="agent-answer markdown-content" data-markdown-renderer="realagent-v2">${renderRealAgentMarkdown(run.answer || '任务已完成，但模型没有返回文本。')}</div>`;
                     return;
                 }
                 if (run.status === 'failed') throw new Error(run.error || '任务执行失败');
@@ -894,6 +896,18 @@
                     <div>${escapeHtml(event.message || '')}</div>${detail ? `<div class="agent-event-detail">${escapeHtml(detail)}</div>` : ''}</div>
                 </div>`;
             }).join('');
+        }
+
+        function renderRealAgentMarkdown(rawText) {
+            let text = String(rawText ?? '').trim();
+            // Some OpenAI-compatible endpoints return a JSON-escaped string or
+            // wrap the whole response in a markdown code fence.
+            if (!text.includes('\n') && text.includes('\\n')) {
+                text = text.replace(/\\r\\n|\\n|\\r/g, '\n').replace(/\\t/g, '\t');
+            }
+            const fenced = text.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```$/i);
+            if (fenced) text = fenced[1].trim();
+            return renderMarkdown(text);
         }
 
         function escapeHtml(value) {

@@ -80,6 +80,8 @@ Miner 会先校验数据库 ID。非 UUID 的旧版 `paper_id` 不再进入 Post
 
 RealAgent 最终回答使用前端内置的 Markdown 渲染器展示，支持标题、列表、粗体、斜体、行内代码和链接，不再显示未经渲染的 Markdown 原文。
 
+最终回答渲染前会兼容 OpenAI 兼容端点可能返回的字面量 `\\n`，并移除包裹整段回答的 ` ```markdown ` 代码围栏。入口 `index.html` 使用 `Cache-Control: no-store`，避免浏览器继续执行旧版渲染逻辑。可在开发者工具中检查最终回答元素的 `data-markdown-renderer="realagent-v2"` 确认新版本已生效。
+
 ## 扩展专业 Agent
 
 在 `agents/autonomous.py` 的工具列表注册 specialist tool，并在 `AgentController.agents` 提供实现。工具描述应明确适用场景和必需字段，专业 Agent 的 `run(input_data)` 应返回可 JSON 序列化结果并校验输入。
