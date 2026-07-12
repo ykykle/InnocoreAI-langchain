@@ -60,6 +60,12 @@ RealAgent 的 Hunter 默认只使用无需密钥的 ArXiv。只有用户明确�
 
 前端进度区以时间线展示监督者规划、专业 Agent 调用、完成与失败；最终回答单独显示，不再把内部 trace 作为原始 JSON 混入答案。
 
+## 论文标识约定
+
+跨 Agent 传递论文时必须区分数据库标识与来源标识：`db_id` 是 PostgreSQL UUID；`external_id` 是 `2606.01899v1` 这样的 ArXiv ID 或 IEEE 平台 ID；`source` 表示来源。Hunter 会为每篇论文返回可直接交给 Miner 的 `analysis_input`。
+
+Miner 会先校验数据库 ID。非 UUID 的旧版 `paper_id` 不再进入 PostgreSQL，而会按 ArXiv 外部 ID 解析；分析报告和向量索引也只会使用合法 UUID 写入数据库。新代码应优先原样传递 `analysis_input`，不要把 `external_id` 改名为 `db_id`。
+
 ## 扩展专业 Agent
 
 在 `agents/autonomous.py` 的工具列表注册 specialist tool，并在 `AgentController.agents` 提供实现。工具描述应明确适用场景和必需字段，专业 Agent 的 `run(input_data)` 应返回可 JSON 序列化结果并校验输入。

@@ -87,6 +87,16 @@ class HunterAgent(BaseAgent):
                 try:
                     downloaded_paper = await self._download_and_save_paper(paper)
                     if downloaded_paper:
+                        downloaded_paper.setdefault("external_id", downloaded_paper.get("id"))
+                        downloaded_paper["analysis_input"] = {
+                            "db_id": downloaded_paper.get("db_id"),
+                            "external_id": downloaded_paper.get("external_id"),
+                            "source": downloaded_paper.get("source"),
+                            "paper_url": downloaded_paper.get("pdf_url"),
+                            "title": downloaded_paper.get("title", ""),
+                            "abstract": downloaded_paper.get("abstract", ""),
+                            "authors": downloaded_paper.get("authors", []),
+                        }
                         downloaded_papers.append(downloaded_paper)
                 except Exception as e:
                     self._add_to_history(f"下载论文失败 {paper.get('title', 'Unknown')}: {str(e)}")

@@ -7,6 +7,7 @@ import asyncio
 from typing import Dict, List, Optional, Any
 import json
 import re
+from uuid import UUID
 from datetime import datetime
 
 from agents.base import BaseAgent
@@ -63,9 +64,15 @@ class MinerAgent(BaseAgent):
                 paper_id = "direct_input"
             # 模式3: paper_id（从数据库获取）
             elif paper_id:
-                paper = await db_manager.get_paper(paper_id)
+                if self._is_uuid(paper_id):
+                    paper = await db_manager.get_paper(paper_id)
+                else:
+                    paper = await self._resolve_paper_from_url(
+                        f"https://arxiv.org/abs/{paper_id}"
+                    )
                 if not paper:
-                    raise AgentException(f"论文不存在: {paper_id}")
+                    raise AgentException(f"无法解析论文标识: {paper_id}")
+                paper_id = paper.get("db_id") or paper.get("id")
             else:
                 raise AgentException("必须提供 paper_id、paper_url 或 title+abstract")
 
@@ -93,14 +100,14 @@ class MinerAgent(BaseAgent):
 
             # 5. 保存报告到数据库（如果有真正的 paper_id）
             report_id = ""
-            if paper_id and paper_id != "direct_input":
+            if paper_id and self._is_uuid(paper_id):
                 try:
                     report_id = await self._save_analysis_report(paper_id, report, user_id)
                 except Exception:
                     pass
 
             # 6. 更新向量库
-            if paper_id:
+            if paper_id and self._is_uuid(paper_id):
                 try:
                     await self._update_vector_store(paper_id, paper, parsed_content, user_id)
                 except Exception:
@@ -148,16 +155,25 @@ class MinerAgent(BaseAgent):
         """获取必需的输入字段 — paper_id 或 paper_url 或 title+abstract"""
         return []  # 改为柔性校验，run() 内部判断
 
+    @staticmethod
+    def _is_uuid(value: Any) -> bool:
+        """数据库 paper_id 必须是 UUID；外部平台 ID 走来源解析。"""
+        try:
+            UUID(str(value))
+            return True
+        except (ValueError, TypeError, AttributeError):
+            return False
+
     async def _resolve_paper_from_url(self, paper_url: str) -> Optional[Dict]:
         """从 ArXiv URL 获取论文元数据"""
         import re
         try:
             import arxiv
             patterns = [
-                r'arxiv\.org/abs/(\d+\.\d+)',
-                r'arxiv\.org/pdf/(\d+\.\d+)',
-                r'arXiv:(\d+\.\d+)',
-                r'^(\d{4}\.\d{4,5})',
+                r'arxiv\.org/abs/(\d+\.\d+(?:v\d+)?)',
+                r'arxiv\.org/pdf/(\d+\.\d+(?:v\d+)?)',
+                r'arXiv:(\d+\.\d+(?:v\d+)?)',
+                r'^(\d{4}\.\d{4,5}(?:v\d+)?)',
             ]
             paper_id = None
             for p in patterns:
@@ -175,6 +191,8 @@ class MinerAgent(BaseAgent):
 
             paper_data = {
                 "id": paper_id,
+                "external_id": paper_id,
+                "source": "arxiv",
                 "title": result.title,
                 "authors": [a.name for a in result.authors],
                 "abstract": result.summary.replace("\n", " ").strip(),
@@ -201,6 +219,8 @@ class MinerAgent(BaseAgent):
                     )
                     paper_data["db_id"] = db_id
                     self._add_to_history(f"论文已存入数据库: {db_id}")
+                else:
+                    paper_data["db_id"] = str(existing["id"])
             except Exception:
                 pass
 

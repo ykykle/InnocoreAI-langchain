@@ -70,6 +70,12 @@ class AutonomousResearchGraph:
                     payload.setdefault("sources", ["arxiv"])
                     payload.setdefault("max_papers", 5)
                     payload.setdefault("days_back", 30)
+                elif name == "miner":
+                    analysis_input = payload.pop("analysis_input", None)
+                    if isinstance(analysis_input, dict):
+                        payload.update({k: v for k, v in analysis_input.items() if v is not None})
+                    if payload.get("external_id") and payload.get("source") == "arxiv" and not payload.get("paper_url"):
+                        payload["paper_url"] = f"https://arxiv.org/abs/{payload['external_id']}"
                 elif name == "coach":
                     payload.setdefault("user_id", "anonymous")
                     payload.setdefault("content", payload.get("text", instruction))
@@ -93,7 +99,7 @@ class AutonomousResearchGraph:
 
         tools = [
             specialist_tool("hunter", "Search papers. ArXiv is always available and the default. IEEE is optional: include it in context.sources only when explicitly requested. context requires keywords (list), and may include max_papers, sources, days_back. Source failures are isolated in source_errors."),
-            specialist_tool("miner", "Read and deeply analyse one paper. context should contain paper_id, paper_url, or title plus abstract."),
+            specialist_tool("miner", "Deeply analyse one paper. Prefer Hunter's analysis_input unchanged. db_id/paper_id may contain only a PostgreSQL UUID. For identifiers like 2606.01899v1 use external_id with source='arxiv', paper_url, or title plus abstract. Never pass an ArXiv/IEEE identifier as db_id."),
             specialist_tool("validator", "Verify metadata and generate citations. context requires paper_info and may contain formats."),
             specialist_tool("coach", "Explain concepts, polish text, or draft research writing. context should contain text, task, and optional style."),
         ]
