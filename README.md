@@ -1,5 +1,7 @@
 # InnoCore AI - 研创·智核
 
+> 已加入由 LLM 自主选择专业 Agent 与工具的 LangGraph RealAgent；原有模块化功能和固定工作流继续保留。使用方法见 [REAL_AGENT_GUIDE.md](REAL_AGENT_GUIDE.md)。
+
 <div align="center">
 
 **智能科研创新助手 | Intelligent Research Innovation Assistant**

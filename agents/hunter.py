@@ -47,33 +47,82 @@ class HunterAgent(BaseAgent):
         try:
             keywords = input_data["keywords"]
             max_papers = input_data.get("max_papers", 20)
-            sources = input_data.get("sources", ["arxiv", "ieee"])
+            sources = [str(source).strip().lower() for source in input_data.get("sources", ["arxiv", "ieee"])]
             days_back = input_data.get("days_back", 1)
             
             all_papers = []
+            source_results = {}
+            source_errors = {}
+            await self.emit_progress("prepare", "已解析检索参数", function="HunterAgent.run", keywords=keywords, sources=sources, max_papers=max_papers)
             
             # 搜索不同来源
             if "arxiv" in sources:
-                arxiv_papers = await self._search_papers_from_arxiv(keywords, max_papers, days_back)
-                all_papers.extend(arxiv_papers)
+                try:
+                    await self.emit_progress("search", "正在调用 ArXiv API", function="_search_papers_from_arxiv", source="arxiv")
+                    arxiv_papers = await self._search_papers_from_arxiv(keywords, max_papers, days_back)
+                    all_papers.extend(arxiv_papers)
+                    source_results["arxiv"] = len(arxiv_papers)
+                    await self.emit_progress("search", f"ArXiv 返回 {len(arxiv_papers)} 篇", function="_search_papers_from_arxiv", source="arxiv", count=len(arxiv_papers))
+                except Exception as exc:
+                    source_errors["arxiv"] = str(exc)
+                    logger.warning("ArXiv source failed; continuing: %s", exc)
             
             if "ieee" in sources:
-                ieee_papers = await self._search_papers_from_ieee(keywords, max_papers, days_back)
-                all_papers.extend(ieee_papers)
+                if not self.config.external_apis.ieee_api_key:
+                    source_errors["ieee"] = "IEEE_API_KEY is not configured; IEEE was skipped"
+                    logger.warning("IEEE_API_KEY is not configured; continuing with other sources")
+                else:
+                    try:
+                        await self.emit_progress("search", "正在调用 IEEE API", function="_search_papers_from_ieee", source="ieee")
+                        ieee_papers = await self._search_papers_from_ieee(keywords, max_papers, days_back)
+                        all_papers.extend(ieee_papers)
+                        source_results["ieee"] = len(ieee_papers)
+                        await self.emit_progress("search", f"IEEE 返回 {len(ieee_papers)} 篇", function="_search_papers_from_ieee", source="ieee", count=len(ieee_papers))
+                    except Exception as exc:
+                        source_errors["ieee"] = str(exc)
+                        logger.warning("IEEE source failed; continuing: %s", exc)
             
             # 去重和筛选
             unique_papers = self._deduplicate_papers(all_papers)
             filtered_papers = await self._filter_papers(unique_papers, keywords)
+            await self.emit_progress("filter", f"去重筛选后保留 {len(filtered_papers)} 篇", function="_filter_papers", count=len(filtered_papers))
             
             # 下载PDF
             downloaded_papers = []
-            for paper in filtered_papers[:max_papers]:
+            selected_papers = filtered_papers[:max_papers]
+            for index, paper in enumerate(selected_papers, 1):
                 try:
+                    await self.emit_progress("download", f"正在处理 PDF {index}/{len(selected_papers)}", function="_download_and_save_paper", current=index, total=len(selected_papers), title=paper.get("title", "")[:100])
                     downloaded_paper = await self._download_and_save_paper(paper)
                     if downloaded_paper:
+                        downloaded_paper.setdefault("external_id", downloaded_paper.get("id"))
+                        downloaded_paper["analysis_input"] = {
+                            "db_id": downloaded_paper.get("db_id"),
+                            "external_id": downloaded_paper.get("external_id"),
+                            "source": downloaded_paper.get("source"),
+                            "paper_url": downloaded_paper.get("pdf_url"),
+                            "title": downloaded_paper.get("title", ""),
+                            "abstract": downloaded_paper.get("abstract", ""),
+                            "authors": downloaded_paper.get("authors", []),
+                        }
                         downloaded_papers.append(downloaded_paper)
+                    await self.emit_progress("download", f"PDF 处理完成 {index}/{len(selected_papers)}", function="_download_and_save_paper", current=index, total=len(selected_papers))
                 except Exception as e:
                     self._add_to_history(f"下载论文失败 {paper.get('title', 'Unknown')}: {str(e)}")
+
+            # Search metadata is valid evidence even when a PDF cannot be
+            # downloaded. Always expose a stable hand-off to downstream agents.
+            for paper in selected_papers:
+                paper.setdefault("external_id", paper.get("id"))
+                paper["analysis_input"] = {
+                    "db_id": paper.get("db_id"),
+                    "external_id": paper.get("external_id"),
+                    "source": paper.get("source"),
+                    "paper_url": paper.get("pdf_url"),
+                    "title": paper.get("title", ""),
+                    "abstract": paper.get("abstract", ""),
+                    "authors": paper.get("authors", []),
+                }
             
             self.set_state("completed")
             
@@ -83,7 +132,10 @@ class HunterAgent(BaseAgent):
                 "unique_papers": len(unique_papers),
                 "filtered_papers": len(filtered_papers),
                 "downloaded_papers": len(downloaded_papers),
-                "papers": downloaded_papers
+                "papers": selected_papers,
+                "source_results": source_results,
+                "source_errors": source_errors,
+                "partial_success": bool(source_errors) and bool(all_papers)
             }
             
         except Exception as e:
@@ -170,7 +222,7 @@ class HunterAgent(BaseAgent):
         # IEEE API需要API key，这里提供基础实现框架
         config = self.config.external_apis
         
-        if not config.ieee_base_url:
+        if not config.ieee_base_url or not config.ieee_api_key:
             logger.warning("IEEE API配置缺失，跳过IEEE搜索")
             self._add_to_history("IEEE API配置缺失，跳过IEEE搜索")
             return papers

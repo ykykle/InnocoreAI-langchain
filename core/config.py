@@ -77,6 +77,7 @@ class ExternalAPIConfig:
     serpapi_key: Optional[str] = None
     arxiv_base_url: str = "http://export.arxiv.org/api/query"
     ieee_base_url: str = "https://ieeexploreapi.ieee.org/api/v1"
+    ieee_api_key: Optional[str] = None
 
 @dataclass
 class InnoCoreConfig:
@@ -152,9 +153,12 @@ class InnoCoreConfig:
         self.external_apis.crossref_api_key = self.external_apis.crossref_api_key or os.getenv("CROSSREF_API_KEY")
         self.external_apis.google_scholar_api_key = self.external_apis.google_scholar_api_key or os.getenv("GOOGLE_SCHOLAR_API_KEY")
         self.external_apis.serpapi_key = self.external_apis.serpapi_key or os.getenv("SERPAPI_KEY")
+        self.external_apis.ieee_api_key = self.external_apis.ieee_api_key or os.getenv("IEEE_API_KEY")
         
         self.debug = os.getenv("DEBUG", "false").lower() == "true"
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
+        self.agent_timeout = int(os.getenv("AGENT_TIMEOUT", str(self.agent_timeout)))
+        self.agent_max_steps = int(os.getenv("AGENT_MAX_STEPS", str(self.agent_max_steps)))
 
 # 全局配置实例
 config = InnoCoreConfig()

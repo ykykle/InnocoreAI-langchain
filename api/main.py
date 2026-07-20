@@ -14,7 +14,7 @@ from core.config import get_config
 from core.database import db_manager
 from core.vector_store import vector_store_manager
 from agents.controller import agent_controller
-from .routes import papers, users, tasks, analysis, writing, citations, workflow
+from .routes import papers, users, tasks, analysis, writing, citations, workflow, agent_chat
 
 # 配置日志 — 确保控制台可见
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -143,6 +143,7 @@ app.include_router(analysis.router, prefix="/api/v1/analysis", tags=["analysis"]
 app.include_router(writing.router, prefix="/api/v1/writing", tags=["writing"])
 app.include_router(citations.router, prefix="/api/v1/citations", tags=["citations"])
 app.include_router(workflow.router, prefix="/api/v1/workflow", tags=["workflow"])
+app.include_router(agent_chat.router, prefix="/api/v1/agent", tags=["real-agent"])
 
 # 挂载静态文件
 from fastapi.staticfiles import StaticFiles
@@ -163,7 +164,11 @@ async def root():
     """根路径 - 返回前端首页"""
     index_path = os.path.join(FRONTEND_DIR, "index.html")
     if os.path.exists(index_path):
-        return FileResponse(index_path)
+        return FileResponse(index_path, headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        })
     return {
         "message": "Welcome to InnoCore AI API",
         "version": "0.1.0",

@@ -490,6 +490,19 @@
             margin: 12px 0;
             line-height: 1.8;
         }
+        .agent-timeline { margin-top: 16px; display: grid; gap: 10px; }
+        .agent-event { display: grid; grid-template-columns: 76px 18px 1fr; gap: 9px; align-items: start; }
+        .agent-event-time { color: #718096; font-size: 12px; padding-top: 3px; }
+        .agent-event-dot { width: 11px; height: 11px; margin-top: 5px; border-radius: 50%; background: #667eea; box-shadow: 0 0 0 4px #edf2ff; }
+        .agent-event.agent_started .agent-event-dot { background: #d69e2e; box-shadow: 0 0 0 4px #fff8df; }
+        .agent-event.agent_completed .agent-event-dot, .agent-event.completed .agent-event-dot { background: #2f855a; box-shadow: 0 0 0 4px #e6ffef; }
+        .agent-event.agent_failed .agent-event-dot, .agent-event.failed .agent-event-dot { background: #c53030; box-shadow: 0 0 0 4px #fff0f0; }
+        .agent-event-body { background: white; border: 1px solid #e2e8f0; padding: 9px 12px; border-radius: 8px; }
+        .agent-event-title { font-weight: 600; color: #2d3748; }
+        .agent-event-detail { color: #718096; font-size: 12px; margin-top: 3px; word-break: break-word; }
+        .agent-answer { margin-top: 16px; padding: 18px; background: white; border-left: 4px solid #2f855a; border-radius: 8px; line-height: 1.75; }
+        .agent-answer > :first-child { margin-top: 0 !important; }
+        .agent-answer > :last-child { margin-bottom: 0 !important; }
     </style>
 </head>
 
@@ -531,6 +544,12 @@
                 </div>
 
                 <div class="features">
+                    <div class="feature-card" onclick="activateAgent('realagent')" id="realagent-card"
+                        style="grid-column: 1 / -1; border-left-color: #16a085; background: #eefcf8;">
+                        <h3>🧠 RealAgent 自主研究助理</h3>
+                        <p>直接描述目标，由 LLM 自主决定调用哪些专业 Agent、工具及执行顺序。工作台实时展示决策进度。</p>
+                        <button class="btn" onclick="event.stopPropagation(); activateAgent('realagent')">自然语言对话</button>
+                    </div>
                     <div class="feature-card" onclick="activateAgent('workflow')" id="workflow-card"
                         style="display: none; grid-column: 1 / -1; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white;">
                         <h3>🔄 完整工作流</h3>
@@ -566,6 +585,18 @@
             </section>
 
             <!-- Hunter Agent 交互面板 -->
+            <div class="interaction-panel" id="realagent-panel">
+                <h3>🧠 RealAgent 自主工作台</h3>
+                <p style="color:#666;margin-bottom:16px">例如：“搜索 3 篇关于 LangGraph multi-agent 的新论文，比较创新点，并生成 BibTeX。”</p>
+                <div class="input-group">
+                    <label for="realagent-input">告诉系统你想完成什么</label>
+                    <textarea id="realagent-input" placeholder="请输入自然语言研究任务……"></textarea>
+                </div>
+                <button class="btn" id="realagent-send" onclick="executeRealAgent()">发送任务</button>
+                <div id="realagent-progress" class="agent-timeline"><div style="color:#718096">等待任务</div></div>
+                <div class="response-area" id="realagent-response"></div>
+            </div>
+
             <div class="interaction-panel" id="hunter-panel">
                 <h3>🕵️ 文献搜索</h3>
                 <div class="input-group">
@@ -799,6 +830,88 @@
             currentAgent = agentType;
             document.getElementById(`${agentType}-card`).classList.add('active');
             document.getElementById(`${agentType}-panel`).classList.add('active');
+        }
+
+        async function executeRealAgent() {
+            const message = document.getElementById('realagent-input').value.trim();
+            const button = document.getElementById('realagent-send');
+            const progress = document.getElementById('realagent-progress');
+            if (!message) { showError('realagent-response', '请输入自然语言任务'); return; }
+            button.disabled = true;
+            progress.textContent = '正在提交任务……';
+            try {
+                const response = await fetch('/api/v1/agent/runs', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({message})
+                });
+                const run = await response.json();
+                if (!response.ok) throw new Error(run.detail || '任务提交失败');
+                await pollRealAgent(run.id);
+            } catch (error) { showError('realagent-response', error.message); }
+            finally { button.disabled = false; }
+        }
+
+        async function pollRealAgent(runId) {
+            const progress = document.getElementById('realagent-progress');
+            while (true) {
+                const response = await fetch(`/api/v1/agent/runs/${runId}`);
+                const run = await response.json();
+                if (!response.ok) throw new Error(run.detail || '无法读取任务状态');
+                renderAgentTimeline(progress, run.events || [], run.status);
+                progress.scrollTop = progress.scrollHeight;
+                if (run.status === 'completed') {
+                    const answer = document.getElementById('realagent-response');
+                    answer.innerHTML = `<div class="result-header">RealAgent 最终回答</div><div class="agent-answer markdown-content" data-markdown-renderer="realagent-v2">${renderRealAgentMarkdown(run.answer || '任务已完成，但模型没有返回文本。')}</div>`;
+                    return;
+                }
+                if (run.status === 'failed') throw new Error(run.error || '任务执行失败');
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+
+        function renderAgentTimeline(container, events, status) {
+            const labels = {
+                planning: '正在规划', decision: 'LLM 决策', agent_started: '调用专业 Agent',
+                agent_progress: 'Agent 内部进度', duplicate_skipped: '跳过重复调用',
+                evidence: '论文证据', evidence_blocked: '证据门控',
+                agent_completed: 'Agent 执行完成', agent_failed: 'Agent 执行失败', completed: '任务完成', failed: '任务失败'
+            };
+            if (!events.length) {
+                container.innerHTML = `<div style="color:#718096">状态：${escapeHtml(status)}</div>`;
+                return;
+            }
+            container.innerHTML = events.map(event => {
+                const details = [];
+                if (event.data?.agent) details.push(`Agent：${event.data.agent}`);
+                if (event.data?.function) details.push(`函数：${event.data.function}`);
+                if (event.data?.stage) details.push(`阶段：${event.data.stage}`);
+                if (event.data?.instruction) details.push(`决策任务：${event.data.instruction}`);
+                if (event.data?.elapsed_seconds !== undefined) details.push(`耗时：${event.data.elapsed_seconds}s`);
+                if (event.data?.current !== undefined && event.data?.total !== undefined) details.push(`进度：${event.data.current}/${event.data.total}`);
+                const detail = details.join(' ｜ ');
+                return `<div class="agent-event ${escapeHtml(event.type)}">
+                    <div class="agent-event-time">${new Date(event.time).toLocaleTimeString()}</div>
+                    <div class="agent-event-dot"></div>
+                    <div class="agent-event-body"><div class="agent-event-title">${escapeHtml(labels[event.type] || event.type)}</div>
+                    <div>${escapeHtml(event.message || '')}</div>${detail ? `<div class="agent-event-detail">${escapeHtml(detail)}</div>` : ''}</div>
+                </div>`;
+            }).join('');
+        }
+
+        function renderRealAgentMarkdown(rawText) {
+            let text = String(rawText ?? '').trim();
+            // Some OpenAI-compatible endpoints return a JSON-escaped string or
+            // wrap the whole response in a markdown code fence.
+            if (!text.includes('\n') && text.includes('\\n')) {
+                text = text.replace(/\\r\\n|\\n|\\r/g, '\n').replace(/\\t/g, '\t');
+            }
+            const fenced = text.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```$/i);
+            if (fenced) text = fenced[1].trim();
+            return renderMarkdown(text);
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
         }
 
         // 执行Hunter任务
