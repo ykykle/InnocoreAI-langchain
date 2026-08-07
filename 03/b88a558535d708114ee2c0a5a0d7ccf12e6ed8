@@ -1,0 +1,26 @@
+test.md
+  s_2da0e3204a99e2::t_880b514aae8841 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "03b88a558535d708114ee2c0a5a0d7ccf12e6ed8",
+  "prompts": {},
+  "humans": {
+    "h_5ebbe4a7242880": {
+      "author": "quziyao.61 <quziyao.61@bytedance.com>"
+    }
+  },
+  "sessions": {
+    "s_2da0e3204a99e2": {
+      "agent_id": {
+        "tool": "trae-cue",
+        "id": "ai_tab-icr-f056b1e3-62ff-4354-bd42-8c38e1ed5c30",
+        "model": "default"
+      },
+      "human_author": "quziyao.61 <quziyao.61@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
