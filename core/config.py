@@ -21,6 +21,7 @@ class LLMProvider(Enum):
 class VectorDBType(Enum):
     """向量数据库类型枚举"""
     QDRANT = "qdrant"
+    PGVECTOR = "pgvector"
     CHROMA = "chroma"
     PINECONE = "pinecone"
 
@@ -41,12 +42,19 @@ class LLMConfig:
 class VectorDBConfig:
     """向量数据库配置"""
     db_type: VectorDBType = VectorDBType.QDRANT
+    # Qdrant connection
     host: str = "localhost"
     port: int = 6333
     api_key: Optional[str] = None
+    https: bool = False
+    # pgvector connection. When omitted, DatabaseConfig is reused.
+    pgvector_connection_string: Optional[str] = None
     collection_name_prefix: str = "innocore"
+    recreate_on_dimension_mismatch: bool = False
+    # Embedding service
     embedding_model: str = "text-embedding-3-small"
     embedding_base_url: Optional[str] = None
+    embedding_api_key: Optional[str] = None
     embedding_provider: str = "openai"  # "openai" | "local"
     embedding_device: Optional[str] = None  # None=auto, "cpu", "cuda"
 
@@ -132,7 +140,34 @@ class InnoCoreConfig:
         if env_model:
             self.llm.model_name = env_model
         
-        # ✅ 新增：读取 Embedding 配置
+        vector_db_type = os.getenv("VECTOR_DB_TYPE", self.vector_db.db_type.value).lower()
+        try:
+            self.vector_db.db_type = VectorDBType(vector_db_type)
+        except ValueError as exc:
+            supported = ", ".join(db_type.value for db_type in VectorDBType)
+            raise ValueError(
+                f"不支持的 VECTOR_DB_TYPE={vector_db_type!r}，可选值: {supported}"
+            ) from exc
+
+        self.vector_db.host = os.getenv("QDRANT_HOST", self.vector_db.host)
+        self.vector_db.port = int(os.getenv("QDRANT_PORT", str(self.vector_db.port)))
+        self.vector_db.api_key = os.getenv("QDRANT_API_KEY") or self.vector_db.api_key
+        self.vector_db.https = os.getenv(
+            "QDRANT_HTTPS", str(self.vector_db.https)
+        ).lower() == "true"
+        self.vector_db.pgvector_connection_string = (
+            os.getenv("PGVECTOR_CONNECTION_STRING")
+            or self.vector_db.pgvector_connection_string
+        )
+        self.vector_db.collection_name_prefix = os.getenv(
+            "VECTOR_COLLECTION_PREFIX", self.vector_db.collection_name_prefix
+        )
+        self.vector_db.recreate_on_dimension_mismatch = os.getenv(
+            "VECTOR_DB_RECREATE_ON_DIMENSION_MISMATCH",
+            str(self.vector_db.recreate_on_dimension_mismatch),
+        ).lower() == "true"
+
+        # Embedding 配置与向量数据库凭据相互独立。
         embedding_model = os.getenv("EMBEDDING_MODEL")
         if embedding_model:
             self.vector_db.embedding_model = embedding_model
@@ -146,7 +181,9 @@ class InnoCoreConfig:
         embedding_device = os.getenv("EMBEDDING_DEVICE")
         if embedding_device:
             self.vector_db.embedding_device = embedding_device
-        self.vector_db.api_key = os.getenv("EMBEDDING_API_KEY") or self.vector_db.api_key
+        self.vector_db.embedding_api_key = (
+            os.getenv("EMBEDDING_API_KEY") or self.vector_db.embedding_api_key
+        )
         self.database.password = self.database.password or os.getenv("DATABASE_PASSWORD")
         self.redis.password = self.redis.password or os.getenv("REDIS_PASSWORD")
         

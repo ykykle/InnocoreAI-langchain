@@ -215,7 +215,11 @@ innocore_ai/
 - Python 3.8+
 - OpenAI API key (or compatible API)
 - Redis (optional, for caching)
-- Qdrant (optional, for vector storage)
+- Qdrant or PostgreSQL with pgvector (optional, for vector storage)
+
+向量数据库可通过 `VECTOR_DB_TYPE=qdrant|pgvector` 切换。配置、选型和
+Qdrant 到 pgvector 的迁移步骤见
+[向量数据库配置与迁移](docs/VECTOR_DATABASE_GUIDE.md)。
 
 ## Development
 
@@ -258,7 +262,7 @@ python run.py
 - [x] LangChain 框架迁移
 
 ### v1.1（计划中）
-- [ ] 向量数据库集成（LangChain QdrantVectorStore）
+- [x] 向量数据库集成（Qdrant / pgvector）
 - [ ] 用户系统与权限管理
 - [ ] 历史记录与收藏功能
 - [ ] 批量处理优化

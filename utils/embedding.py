@@ -158,7 +158,9 @@ class EmbeddingService:
 
     async def _init_openai(self):
         """初始化远程 OpenAI-compatible API"""
-        embedding_api_key = self.config.vector_db.api_key or self.config.llm.api_key
+        embedding_api_key = (
+            self.config.vector_db.embedding_api_key or self.config.llm.api_key
+        )
         embedding_base_url = getattr(self.config.vector_db, 'embedding_base_url', None)
 
         if not embedding_api_key:
@@ -168,7 +170,11 @@ class EmbeddingService:
                 "或设置 EMBEDDING_PROVIDER=local 使用本地模型。"
             )
 
-        api_key_source = "EMBEDDING_API_KEY" if self.config.vector_db.api_key else "OPENAI_API_KEY"
+        api_key_source = (
+            "EMBEDDING_API_KEY"
+            if self.config.vector_db.embedding_api_key
+            else "OPENAI_API_KEY"
+        )
         logger.info(f"Embedding 服务: OPENAI 模式")
         logger.info(f"  - 模型: {self.embedding_model}")
         logger.info(f"  - Base URL: {embedding_base_url or self.config.llm.base_url}")

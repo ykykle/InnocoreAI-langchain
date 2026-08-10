@@ -40,15 +40,17 @@ def check_dependencies():
     required_packages = [
         "fastapi",
         "uvicorn",
-        "hello_agents",
         "arxiv",
         "httpx",
         "asyncpg",
-        "qdrant_client",
         "feedparser",
         "beautifulsoup4",
-        "langchain_qdrant"
+        "langchain_core",
     ]
+    if os.getenv("VECTOR_DB_TYPE", "qdrant").lower() == "pgvector":
+        required_packages.extend(["langchain_postgres", "psycopg", "pgvector"])
+    else:
+        required_packages.extend(["qdrant_client", "langchain_qdrant"])
     
     missing = []
     for package in required_packages:
@@ -385,131 +387,56 @@ def check_database_tables():
         print(f"❌ 表检查失败: {str(e)}")
         return False
 
-def check_qdrant_connection():
-    """检查 Qdrant 向量数据库连接"""
+def check_vector_database_connection():
+    """检查当前配置的向量数据库连接"""
     print("\n" + "="*60)
-    print("9. 检查 Qdrant 向量数据库")
+    print("9. 检查向量数据库")
     print("="*60)
-    
+
     try:
-        from core.config import get_config
-        from qdrant_client import QdrantClient
-        from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
-        from core.vector_store import vector_store_manager
-        config = get_config().vector_db
-        
-        # 显示 Qdrant 配置
-        print(f"Qdrant 配置:")
-        print(f"  - 主机: {config.host}")
-        print(f"  - 端口: {config.port}")
-        # print(f"  - 超时: {config.timeout}s")
-        
-        print(f"\n正在连接到 Qdrant...")
-        
-        try:
-            vector_store_manager.initialize()
-            # # 创建客户端连接
-            # client = QdrantClient(
-            #     host=config.host,
-            #     port=config.port,
-            #     timeout=config.timeout
-            # )
-            
-            # # 测试连接 - 获取服务器信息
-            # collection_response = client.get_collections()
-            # collections = [c.name for c in collection_response.collections] if collection_response.collections else []
-            
-            # print(f"✅ Qdrant 连接成功")
-            
-            # # 检查集合
-            # expected_collections = ['L1_collection', 'L2_collection']
-            # missing_collections = [c for c in expected_collections if c not in collections]
-            
-            # if collections:
-            #     print(f"\n✅ 发现 {len(collections)} 个 Collection:")
-            #     for col in collections:
-            #         print(f"   - {col}")
-            # else:
-            #     print(f"\n⚠️  暂无 Collection，将在首次使用时创建")
-            
-            # if missing_collections:
-            #     print(f"\n⚠️  缺少以下 Collection:")
-            #     for col in missing_collections:
-            #         print(f"   - {col}（将在首次使用时自动创建）")
-            
-            # # 检查向量维度配置
-            # print(f"\n向量配置:")
-            # print(f"  - 向量维度: 1536 (OpenAI embedding)")
-            # print(f"  - L1 Collection: 预设集合（系统级）")
-            # print(f"  - L2 Collection: 用户集合（用户级）")
-            
+        from core.config import VectorDBType, get_config
+
+        app_config = get_config()
+        vector_config = app_config.vector_db
+        print(f"后端: {vector_config.db_type.value}")
+
+        if vector_config.db_type == VectorDBType.QDRANT:
+            from qdrant_client import QdrantClient
+
+            print(f"地址: {vector_config.host}:{vector_config.port}")
+            client = QdrantClient(
+                host=vector_config.host,
+                port=vector_config.port,
+                api_key=vector_config.api_key,
+                https=vector_config.https,
+                prefer_grpc=False,
+                check_compatibility=False,
+            )
+            collections = client.get_collections().collections
+            client.close()
+            print(f"✅ Qdrant 连接成功，现有 Collection: {len(collections)}")
             return True
-        
-        except TimeoutError:
-            return False, f"连接超时（{config.timeout}s）。请检查：\n" \
-                   f"  1. Qdrant 服务是否正在运行\n" \
-                   f"  2. 主机地址是否正确: {config.host}\n" \
-                   f"  3. 端口号是否正确: {config.port}\n" \
-                   f"  4. 网络连接是否正常\n" \
-                   f"  5. 防火墙是否阻止了连接\n\n" \
-                   f"  启动 Qdrant:\n" \
-                   f"    - Docker: docker run -d -p 6333:6333 qdrant/qdrant\n" \
-                   f"    - 本地: qdrant (需要先安装)"
-        
-        except ConnectionRefusedError:
-            return False, f"连接被拒绝。请检查：\n" \
-                   f"  1. Qdrant 服务是否在运行\n" \
-                   f"  2. 正在监听 {config.host}:{config.port}\n" \
-                   f"  3. 防火墙配置\n\n" \
-                   f"  启动 Qdrant:\n" \
-                   f"    - Docker: docker run -d -p 6333:6333 qdrant/qdrant\n" \
-                   f"    - Linux/macOS: qdrant\n" \
-                   f"    - Windows: qdrant.exe"
-        
-        except (ResponseHandlingException, UnexpectedResponse, Exception) as e:
-            error_msg = str(e).lower()
-            
-            if 'connection refused' in error_msg or 'refused' in error_msg:
-                return False, f"连接被拒绝: {config.host}:{config.port}\n" \
-                       f"  请检查 Qdrant 服务是否启动\n\n" \
-                       f"  启动命令:\n" \
-                       f"    - Docker: docker run -d -p 6333:6333 qdrant/qdrant\n" \
-                       f"    - 本地: qdrant"
-            
-            elif 'connection reset' in error_msg:
-                return False, f"连接被重置。请检查：\n" \
-                       f"  1. Qdrant 服务是否崩溃\n" \
-                       f"  2. 网络连接是否稳定\n" \
-                       f"  3. 防火墙规则"
-            
-            elif 'name or service not known' in error_msg or 'nodename nor servname provided' in error_msg:
-                return False, f"无法解析主机名: {config.host}\n" \
-                       f"  请检查：\n" \
-                       f"  1. 主机名是否拼写正确\n" \
-                       f"  2. 如果是 Docker 容器名，容器是否正在运行\n" \
-                       f"  3. DNS 是否正常工作\n\n" \
-                       f"  Docker 容器查询:\n" \
-                       f"    docker ps | grep qdrant"
-            
-            elif 'network is unreachable' in error_msg:
-                return False, f"网络无法到达: {config.host}:{config.port}\n" \
-                       f"  请检查：\n" \
-                       f"  1. 网络连接\n" \
-                       f"  2. Qdrant 主机是否在线\n" \
-                       f"  3. VPN 或代理配置"
-            
-            else:
-                return False, f"连接异常: {str(e)}\n\n" \
-                       f"  尝试步骤：\n" \
-                       f"  1. 启动 Qdrant: docker run -d -p 6333:6333 qdrant/qdrant\n" \
-                       f"  2. 验证配置: cat .env | grep QDRANT"
-    
-    except ImportError as e:
-        return False, f"缺少依赖包: qdrant-client\n" \
-               f"  安装命令: pip install qdrant-client"
-    
+
+        if vector_config.db_type == VectorDBType.PGVECTOR:
+            import psycopg
+            from core.vector_store import VectorStoreManager
+
+            manager = VectorStoreManager()
+            manager._pg_connection_string = manager._build_pg_connection_string()
+            with psycopg.connect(manager._psycopg_connection_string()) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+                    )
+                    row = cursor.fetchone()
+            if not row:
+                return False, "PostgreSQL 已连接，但尚未安装 vector 扩展"
+            print(f"✅ pgvector 连接成功，扩展版本: {row[0]}")
+            return True
+
+        return False, f"诊断工具暂不支持 {vector_config.db_type.value}"
     except Exception as e:
-        return False, f"检查失败: {str(e)}"
+        return False, f"向量数据库连接失败: {str(e)}"
 
 def check_embedding_service():
     """检查嵌入服务初始化"""
@@ -575,7 +502,7 @@ def main():
     # results.append(("LLM 连接", check_llm_connection()))
     results.append(("数据库连接", check_database_connection()))
     results.append(("数据库表", check_database_tables()))
-    results.append(("Qdrant 连接", check_qdrant_connection()))
+    results.append(("向量数据库连接", check_vector_database_connection()))
     results.append(("嵌入服务", check_embedding_service()))
     
     # 总结
@@ -602,7 +529,7 @@ def main():
     else:
         print("\n⚠️  部分检查未通过，请根据上述提示修复问题。")
         print("\n常见问题排查:")
-        print("  1. Qdrant 连接问题 → docker run -d -p 6333:6333 qdrant/qdrant")
+        print("  1. 向量数据库连接问题 → 检查 VECTOR_DB_TYPE 和对应连接配置")
         print("  2. 数据库连接问题 → 检查 PostgreSQL 是否启动")
         print("  3. 依赖包缺失 → 运行 pip install -r requirements.txt")
         print("  4. 表不存在 → 运行 python install.py 初始化数据库")

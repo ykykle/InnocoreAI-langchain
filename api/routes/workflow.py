@@ -22,6 +22,7 @@ def get_model_info() -> Dict[str, Any]:
         "llm_base_url": config.llm.base_url or "OpenAI 默认",
         "embedding_model": config.vector_db.embedding_model,
         "embedding_base_url": getattr(config.vector_db, 'embedding_base_url', None) or config.llm.base_url or "OpenAI 默认",
+        "vector_db_type": config.vector_db.db_type.value,
     }
 
 

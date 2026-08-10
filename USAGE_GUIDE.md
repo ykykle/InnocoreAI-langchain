@@ -288,13 +288,23 @@ LLM_API_KEY=your_api_key
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL_NAME=gpt-3.5-turbo
 
-# 数据库配置（可选）
-DATABASE_URL=postgresql://user:password@localhost:5432/innocore
+# PostgreSQL 配置（可选）
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=innocore_ai
+POSTGRES_USER=user
+POSTGRES_PASSWORD=password
 
-# 向量数据库配置（可选）
+# 向量数据库配置：qdrant 或 pgvector（可选）
+VECTOR_DB_TYPE=qdrant
 QDRANT_HOST=localhost
 QDRANT_PORT=6333
+
+# 使用 pgvector 时默认复用 POSTGRES_*，也可指定独立连接：
+# PGVECTOR_CONNECTION_STRING=postgresql://user:password@localhost:5432/innocore_ai
 ```
+
+完整配置与迁移步骤见 `docs/VECTOR_DATABASE_GUIDE.md`。
 
 ### 模型选择
 

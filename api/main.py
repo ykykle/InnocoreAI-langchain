@@ -188,7 +188,7 @@ async def health_check():
             "timestamp": "2024-01-01T00:00:00Z",
             "components": {
                 "database": "connected",
-                "vector_store": "connected",
+                "vector_store": vector_store_manager.get_initialization_status(),
                 "agents": agent_status
             }
         }

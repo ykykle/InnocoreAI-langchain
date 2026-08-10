@@ -1,532 +1,619 @@
 """
-InnoCore AI 向量存储管理模块 - 基于 LangChain 框架
+InnoCore AI vector store manager.
+
+The public manager API is backend-neutral. Qdrant and pgvector are selected
+through VECTOR_DB_TYPE without leaking backend-specific filters into agents.
 """
 
 import asyncio
-from typing import List, Dict, Optional, Any, Tuple
-import numpy as np
+import logging
+import re
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-import threading
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote_plus
 
-# LangChain 向量存储组件
-from langchain_qdrant import QdrantVectorStore
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
-# Qdrant 客户端
-from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
-from qdrant_client.http.models import CollectionInfo
-
-import hashlib
-import json
-
-from .config import get_config
+from .config import VectorDBType, get_config
 from .exceptions import VectorStoreException
+
+logger = logging.getLogger(__name__)
 
 
 class LangChainEmbeddings(Embeddings):
-    """LangChain Embeddings 适配器"""
-    
+    """Adapt the project's async embedding service to LangChain."""
+
     def __init__(self, embedding_service):
         self.embedding_service = embedding_service
-        # 创建线程池用于运行异步操作
-        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="embedding_")
-    
-    def _run_async_in_thread(self, coro):
-        """在新线程中运行异步代码"""
+        self._executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="embedding_"
+        )
+
+    def _run_async_in_thread(self, coroutine):
         def run_in_new_loop():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                return loop.run_until_complete(coro)
+                return loop.run_until_complete(coroutine)
             finally:
                 loop.close()
-        
-        # 在线程池中运行
-        future = self._executor.submit(run_in_new_loop)
-        return future.result(timeout=120)
-    
+
+        return self._executor.submit(run_in_new_loop).result(timeout=120)
+
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """批量嵌入文档"""
         try:
-            # 检查是否有事件循环在运行
-            try:
-                loop = asyncio.get_running_loop()
-                # 有事件循环在运行，使用线程池运行异步代码
-                return self._run_async_in_thread(
-                    self.embedding_service.generate_batch_embeddings(texts)
-                )
-            except RuntimeError:
-                # 没有事件循环在运行，直接运行
-                return asyncio.run(
-                    self.embedding_service.generate_batch_embeddings(texts)
-                )
-        except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.error(f"批量嵌入失败: {str(e)}")
-            raise RuntimeError(f"向量生成失败: {str(e)}") from e
-    
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(
+                self.embedding_service.generate_batch_embeddings(texts)
+            )
+        return self._run_async_in_thread(
+            self.embedding_service.generate_batch_embeddings(texts)
+        )
+
     def embed_query(self, text: str) -> List[float]:
-        """嵌入查询"""
         try:
-            # 检查是否有事件循环在运行
-            try:
-                loop = asyncio.get_running_loop()
-                # 有事件循环在运行，使用线程池运行异步代码
-                return self._run_async_in_thread(
-                    self.embedding_service.generate_embedding(text)
-                )
-            except RuntimeError:
-                # 没有事件循环在运行，直接运行
-                return asyncio.run(
-                    self.embedding_service.generate_embedding(text)
-                )
-        except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.error(f"查询嵌入失败: {str(e)}")
-            raise RuntimeError(f"向量生成失败: {str(e)}") from e
-    
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.embedding_service.generate_embedding(text))
+        return self._run_async_in_thread(
+            self.embedding_service.generate_embedding(text)
+        )
+
     async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
-        """异步批量嵌入文档"""
         return await self.embedding_service.generate_batch_embeddings(texts)
-    
+
     async def aembed_query(self, text: str) -> List[float]:
-        """异步嵌入查询"""
         return await self.embedding_service.generate_embedding(text)
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False)
 
 
 class VectorStoreManager:
-    """向量存储管理器 - LangChain 实现"""
-    
+    """Backend-neutral L1/L2 vector store manager."""
+
     def __init__(self):
-        self.config = get_config().vector_db
+        app_config = get_config()
+        self.config = app_config.vector_db
+        self.database_config = app_config.database
+        self.backend = self.config.db_type
         self.client = None
         self.l1_collection = f"{self.config.collection_name_prefix}_l1_preset"
         self.l2_collection = f"{self.config.collection_name_prefix}_l2_user"
-        
-        # LangChain 向量存储
-        self.l1_vectorstore: Optional[QdrantVectorStore] = None
-        self.l2_vectorstore: Optional[QdrantVectorStore] = None
-        
-        # 嵌入服务
+        self.l1_vectorstore = None
+        self.l2_vectorstore = None
         self.embeddings: Optional[LangChainEmbeddings] = None
-    
+        self.embedding_dimension: Optional[int] = None
+        self._pg_connection_string: Optional[str] = None
+
     async def initialize(self, embedding_service=None):
-        """初始化向量数据库连接"""
+        """Initialize the selected vector database and its collections."""
+        if embedding_service is None:
+            raise VectorStoreException(
+                "初始化向量数据库必须提供 embedding_service"
+            )
+
         try:
-            # 初始化 Qdrant 客户端
-            # 禁用 HTTPS 和版本检查以支持本地 HTTP 连接
-            self.client = QdrantClient(
-                host=self.config.host,
-                port=self.config.port,
-                api_key=self.config.api_key,
-                prefer_grpc=False,  # 使用 HTTP REST API 而不是 gRPC
-                https=False,  # 明确指定不使用 HTTPS
-                check_compatibility=False  # 跳过版本检查
-            )
-            
-            # 设置嵌入服务
-            embedding_dimension = None
-            if embedding_service:
-                self.embeddings = LangChainEmbeddings(embedding_service)
-                # 获取实际的 embedding 维度
-                embedding_dimension = await self._get_embedding_dimension()
-            
-            # 创建集合（使用实际的 embedding 维度）
-            await self._create_collections(embedding_dimension)
-            
-            # 初始化 LangChain 向量存储
-            if embedding_service:
-                self._init_langchain_vectorstores()
-            
-        except Exception as e:
-            raise VectorStoreException(f"向量数据库初始化失败: {str(e)}")
-    
-    def _init_langchain_vectorstores(self):
-        """初始化 LangChain 向量存储"""
-        if not self.embeddings:
-            return
-        
-        try:
-            # L1 预置库向量存储
-            self.l1_vectorstore = QdrantVectorStore(
-                client=self.client,
-                collection_name=self.l1_collection,
-                embedding=self.embeddings,
-            )
-            
-            # L2 用户库向量存储
-            self.l2_vectorstore = QdrantVectorStore(
-                client=self.client,
-                collection_name=self.l2_collection,
-                embedding=self.embeddings,
-            )
-        except Exception as e:
-            raise VectorStoreException(f"LangChain 向量存储初始化失败: {str(e)}")
-    
+            self.embeddings = LangChainEmbeddings(embedding_service)
+            self.embedding_dimension = await self._get_embedding_dimension()
+
+            if self.backend == VectorDBType.QDRANT:
+                await self._initialize_qdrant()
+            elif self.backend == VectorDBType.PGVECTOR:
+                await self._initialize_pgvector()
+            else:
+                raise VectorStoreException(
+                    f"当前未实现向量数据库后端: {self.backend.value}"
+                )
+        except VectorStoreException:
+            raise
+        except Exception as exc:
+            raise VectorStoreException(
+                f"{self.backend.value} 初始化失败: {exc}"
+            ) from exc
+
     async def _get_embedding_dimension(self) -> int:
-        """获取 embedding 的实际维度"""
-        if not self.embeddings:
-            return 1536  # 默认返回 OpenAI 维度
-        
         try:
-            # 生成一个测试 embedding 来获取维度
-            test_embedding = await self.embeddings.aembed_query("test")
-            return len(test_embedding)
-        except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(f"无法获取 embedding 维度，使用默认值 1536: {str(e)}")
-            return 1536
-    
-    async def _create_collections(self, embedding_dimension: int = None):
-        """创建向量集合"""
-        if embedding_dimension is None:
-            embedding_dimension = 1536  # 默认 OpenAI 维度
-        
-        collections = [
-            (self.l1_collection, "L1预置库"),
-            (self.l2_collection, "L2用户库")
-        ]
-        
-        for collection_name, description in collections:
-            try:
-                # 检查集合是否已存在
-                existing_collection = self.client.get_collection(collection_name)
-                
-                # 检查维度是否匹配
-                existing_dim = existing_collection.config.params.vectors.size
-                if existing_dim != embedding_dimension:
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.warning(
-                        f"集合 {collection_name} 维度不匹配 "
-                        f"(现有: {existing_dim}, 新: {embedding_dimension})，"
-                        f"将删除并重新创建"
-                    )
-                    # 删除不匹配的集合
+            embedding = await self.embeddings.aembed_query("dimension probe")
+        except Exception as exc:
+            raise VectorStoreException(
+                f"无法检测 Embedding 维度: {exc}"
+            ) from exc
+        if not embedding:
+            raise VectorStoreException("Embedding 服务返回了空向量")
+        return len(embedding)
+
+    async def _initialize_qdrant(self) -> None:
+        try:
+            from langchain_qdrant import QdrantVectorStore
+            from qdrant_client import QdrantClient
+            from qdrant_client.models import Distance, VectorParams
+        except ImportError as exc:
+            raise VectorStoreException(
+                "使用 Qdrant 需要安装 langchain-qdrant 和 qdrant-client"
+            ) from exc
+
+        self.client = QdrantClient(
+            host=self.config.host,
+            port=self.config.port,
+            api_key=self.config.api_key,
+            prefer_grpc=False,
+            https=self.config.https,
+            check_compatibility=False,
+        )
+
+        for collection_name in (self.l1_collection, self.l2_collection):
+            if self.client.collection_exists(collection_name):
+                info = self.client.get_collection(collection_name)
+                existing_dimension = info.config.params.vectors.size
+                if existing_dimension != self.embedding_dimension:
+                    if not self.config.recreate_on_dimension_mismatch:
+                        raise VectorStoreException(
+                            f"Qdrant collection {collection_name} 的维度为 "
+                            f"{existing_dimension}，当前 Embedding 维度为 "
+                            f"{self.embedding_dimension}。请迁移/重建索引，或在确认"
+                            "可丢弃旧向量后设置 "
+                            "VECTOR_DB_RECREATE_ON_DIMENSION_MISMATCH=true"
+                        )
+                    logger.warning("重建维度不匹配的 collection: %s", collection_name)
                     self.client.delete_collection(collection_name)
-                    # 创建新集合
                     self.client.create_collection(
                         collection_name=collection_name,
                         vectors_config=VectorParams(
-                            size=embedding_dimension,
-                            distance=Distance.COSINE
-                        )
+                            size=self.embedding_dimension,
+                            distance=Distance.COSINE,
+                        ),
                     )
-                else:
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    logger.info(f"集合 {collection_name} 维度匹配，使用现有集合")
-            except Exception as e:
-                # 集合不存在，创建新集合
+            else:
                 self.client.create_collection(
                     collection_name=collection_name,
                     vectors_config=VectorParams(
-                        size=embedding_dimension,
-                        distance=Distance.COSINE
-                    )
+                        size=self.embedding_dimension,
+                        distance=Distance.COSINE,
+                    ),
                 )
-    
-    def _generate_point_id(self, content: str) -> str:
-        """生成向量点ID"""
-        return hashlib.md5(content.encode()).hexdigest()
-    
-    async def add_to_l1(self, paper_id: str, title: str, abstract: str, 
-                       content: str, metadata: Dict = None) -> str:
-        """添加到L1预置库 - 使用 LangChain"""
+
+        self.l1_vectorstore = QdrantVectorStore(
+            client=self.client,
+            collection_name=self.l1_collection,
+            embedding=self.embeddings,
+        )
+        self.l2_vectorstore = QdrantVectorStore(
+            client=self.client,
+            collection_name=self.l2_collection,
+            embedding=self.embeddings,
+        )
+
+    def _build_pg_connection_string(self) -> str:
+        configured = self.config.pgvector_connection_string
+        if configured:
+            if configured.startswith("postgresql://"):
+                return configured.replace(
+                    "postgresql://", "postgresql+psycopg://", 1
+                )
+            if configured.startswith("postgres://"):
+                return configured.replace(
+                    "postgres://", "postgresql+psycopg://", 1
+                )
+            return configured
+
+        db = self.database_config
+        return (
+            "postgresql+psycopg://"
+            f"{quote_plus(db.username)}:{quote_plus(db.password)}"
+            f"@{db.host}:{db.port}/{db.database}"
+        )
+
+    def _psycopg_connection_string(self) -> str:
+        return self._pg_connection_string.replace(
+            "postgresql+psycopg://", "postgresql://", 1
+        )
+
+    async def _initialize_pgvector(self) -> None:
         try:
-            if self.l1_vectorstore:
-                # 使用 LangChain 添加文档
-                doc = Document(
-                    page_content=f"{title} {abstract} {content}",
-                    metadata={
-                        "paper_id": paper_id,
-                        "title": title,
-                        "abstract": abstract,
-                        "collection_type": "l1",
-                        **(metadata or {})
-                    }
-                )
-                
-                ids = await asyncio.to_thread(
-                    self.l1_vectorstore.add_documents,
-                    [doc]
-                )
-                
-                return ids[0] if ids else ""
-            else:
-                # 降级为直接操作
-                return await self._add_to_collection_direct(
-                    self.l1_collection, paper_id, title, abstract, content, metadata
-                )
-            
-        except Exception as e:
-            raise VectorStoreException(f"添加到L1库失败: {str(e)}")
-    
-    async def add_to_l2(self, user_id: str, paper_id: str, title: str, 
-                       abstract: str, content: str, metadata: Dict = None) -> str:
-        """添加到L2用户库 - 使用 LangChain"""
+            from langchain_postgres import PGVector
+        except ImportError as exc:
+            raise VectorStoreException(
+                "使用 pgvector 需要安装 langchain-postgres 和 psycopg"
+            ) from exc
+
+        self._pg_connection_string = self._build_pg_connection_string()
+        await asyncio.to_thread(self._ensure_pgvector_extension)
+
+        common_options = {
+            "embeddings": self.embeddings,
+            "connection": self._pg_connection_string,
+            "use_jsonb": True,
+            "embedding_length": self.embedding_dimension,
+            "create_extension": False,
+        }
+        self.l1_vectorstore = PGVector(
+            collection_name=self.l1_collection,
+            collection_metadata={
+                "embedding_dimension": self.embedding_dimension,
+                "embedding_model": self.config.embedding_model,
+            },
+            **common_options,
+        )
+        await asyncio.to_thread(self._validate_pgvector_dimension)
+        self.l2_vectorstore = PGVector(
+            collection_name=self.l2_collection,
+            collection_metadata={
+                "embedding_dimension": self.embedding_dimension,
+                "embedding_model": self.config.embedding_model,
+            },
+            **common_options,
+        )
+
+    def _ensure_pgvector_extension(self) -> None:
         try:
-            if self.l2_vectorstore:
-                # 使用 LangChain 添加文档
-                doc = Document(
-                    page_content=f"{title} {abstract} {content}",
-                    metadata={
-                        "user_id": user_id,
-                        "paper_id": paper_id,
-                        "title": title,
-                        "abstract": abstract,
-                        "collection_type": "l2",
-                        **(metadata or {})
-                    }
-                )
-                
-                ids = await asyncio.to_thread(
-                    self.l2_vectorstore.add_documents,
-                    [doc]
-                )
-                
-                return ids[0] if ids else ""
-            else:
-                # 降级为直接操作
-                return await self._add_to_collection_direct(
-                    self.l2_collection, paper_id, title, abstract, content, 
-                    {**{"user_id": user_id}, **(metadata or {})}
-                )
-            
-        except Exception as e:
-            raise VectorStoreException(f"添加到L2库失败: {str(e)}")
-    
-    async def _add_to_collection_direct(self, collection_name: str, 
-                                        paper_id: str, title: str, 
-                                        abstract: str, content: str, 
-                                        metadata: Dict = None) -> str:
-        """直接添加到集合（降级方案）"""
+            import psycopg
+        except ImportError as exc:
+            raise VectorStoreException(
+                "pgvector 后端缺少 psycopg 依赖"
+            ) from exc
+
         try:
-            # 生成embedding
-            embedding = await self._generate_embedding(f"{title} {abstract} {content}")
-            
-            point_id = self._generate_point_id(f"{paper_id}_{collection_name}")
-            
-            point = PointStruct(
-                id=point_id,
-                vector=embedding,
-                payload={
-                    "paper_id": paper_id,
-                    "title": title,
-                    "abstract": abstract,
-                    "content": content[:1000],
-                    "metadata": metadata or {},
-                    "collection_type": "l1" if "l1" in collection_name else "l2",
-                    "created_at": str(asyncio.get_event_loop().time())
-                }
+            with psycopg.connect(self._psycopg_connection_string()) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                connection.commit()
+        except Exception as exc:
+            raise VectorStoreException(
+                "无法启用 PostgreSQL vector 扩展。请使用带 pgvector 的镜像，"
+                "并确保当前用户具有 CREATE EXTENSION 权限。"
+            ) from exc
+
+    def _validate_pgvector_dimension(self) -> None:
+        import psycopg
+
+        query = """
+            SELECT format_type(attribute.atttypid, attribute.atttypmod)
+            FROM pg_attribute AS attribute
+            JOIN pg_class AS table_info
+              ON table_info.oid = attribute.attrelid
+            WHERE table_info.relname = 'langchain_pg_embedding'
+              AND attribute.attname = 'embedding'
+              AND NOT attribute.attisdropped
+        """
+        with psycopg.connect(self._psycopg_connection_string()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query)
+                row = cursor.fetchone()
+
+        column_type = row[0] if row else ""
+        match = re.fullmatch(r"vector\((\d+)\)", column_type)
+        if match and int(match.group(1)) != self.embedding_dimension:
+            raise VectorStoreException(
+                "pgvector 表 langchain_pg_embedding 的维度为 "
+                f"{match.group(1)}，当前 Embedding 维度为 "
+                f"{self.embedding_dimension}。请使用新的数据库/schema，"
+                "或在备份后重建 pgvector 表并重新生成全部向量。"
             )
-            
-            self.client.upsert(
-                collection_name=collection_name,
-                points=[point]
-            )
-            
-            return point_id
-            
-        except Exception as e:
-            raise VectorStoreException(f"直接添加失败: {str(e)}")
-    
-    async def hybrid_search(self, query: str, user_id: str = None, 
-                           top_k: int = 5, include_l1: bool = True,
-                           include_l2: bool = True) -> List[Dict]:
-        """混合搜索 - 使用 LangChain 相似度搜索"""
+
+    def _document_id(
+        self, collection_name: str, paper_id: str, user_id: Optional[str] = None
+    ) -> str:
+        source = f"{collection_name}:{user_id or ''}:{paper_id}"
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, source))
+
+    async def add_to_l1(
+        self,
+        paper_id: str,
+        title: str,
+        abstract: str,
+        content: str,
+        metadata: Dict = None,
+    ) -> str:
+        document = self._build_document(
+            paper_id, title, abstract, content, "l1", metadata
+        )
+        return await self._add_document(
+            self.l1_vectorstore,
+            document,
+            self._document_id(self.l1_collection, paper_id),
+            "L1",
+        )
+
+    async def add_to_l2(
+        self,
+        user_id: str,
+        paper_id: str,
+        title: str,
+        abstract: str,
+        content: str,
+        metadata: Dict = None,
+    ) -> str:
+        document = self._build_document(
+            paper_id,
+            title,
+            abstract,
+            content,
+            "l2",
+            {"user_id": user_id, **(metadata or {})},
+        )
+        return await self._add_document(
+            self.l2_vectorstore,
+            document,
+            self._document_id(self.l2_collection, paper_id, user_id),
+            "L2",
+        )
+
+    @staticmethod
+    def _build_document(
+        paper_id: str,
+        title: str,
+        abstract: str,
+        content: str,
+        collection_type: str,
+        metadata: Optional[Dict],
+    ) -> Document:
+        return Document(
+            page_content=f"{title} {abstract} {content}",
+            metadata={
+                "paper_id": paper_id,
+                "title": title,
+                "abstract": abstract,
+                "collection_type": collection_type,
+                **(metadata or {}),
+            },
+        )
+
+    async def _add_document(
+        self, vectorstore, document: Document, document_id: str, label: str
+    ) -> str:
+        if vectorstore is None:
+            raise VectorStoreException(f"{label} 向量存储未初始化")
         try:
+            ids = await asyncio.to_thread(
+                vectorstore.add_documents, [document], ids=[document_id]
+            )
+            return str(ids[0]) if ids else ""
+        except Exception as exc:
+            raise VectorStoreException(f"添加到{label}库失败: {exc}") from exc
+
+    def _user_filter(self, user_id: str):
+        if self.backend == VectorDBType.PGVECTOR:
+            return {"user_id": {"$eq": user_id}}
+
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        return Filter(
+            must=[
+                FieldCondition(
+                    key="metadata.user_id",
+                    match=MatchValue(value=user_id),
+                )
+            ]
+        )
+
+    async def hybrid_search(
+        self,
+        query: str,
+        user_id: str = None,
+        top_k: int = 5,
+        include_l1: bool = True,
+        include_l2: bool = True,
+    ) -> List[Dict]:
+        """Search vectors and combine normalized relevance with keyword overlap."""
+        try:
+            app_config = get_config()
+            vector_weight = app_config.hybrid_search_weights.get("vector", 0.7)
+            keyword_weight = app_config.hybrid_search_weights.get("keyword", 0.3)
             results = []
-            
-            config = get_config()
-            vector_weight = config.hybrid_search_weights.get("vector", 0.7)
-            keyword_weight = config.hybrid_search_weights.get("keyword", 0.3)
-            
-            # L1库搜索
+
             if include_l1 and self.l1_vectorstore:
-                l1_docs = await asyncio.to_thread(
-                    self.l1_vectorstore.similarity_search_with_score,
-                    query, top_k
+                matches = await asyncio.to_thread(
+                    self.l1_vectorstore.similarity_search_with_relevance_scores,
+                    query,
+                    k=top_k,
                 )
-                
-                for doc, score in l1_docs:
-                    results.append({
-                        "id": doc.metadata.get("paper_id", ""),
-                        "score": score * vector_weight,
-                        "payload": {
-                            "paper_id": doc.metadata.get("paper_id", ""),
-                            "title": doc.metadata.get("title", ""),
-                            "abstract": doc.metadata.get("abstract", ""),
-                            **doc.metadata
-                        },
-                        "collection_type": "l1"
-                    })
-            
-            # L2库搜索
+                results.extend(
+                    self._format_matches(matches, "l1", vector_weight)
+                )
+
             if include_l2 and user_id and self.l2_vectorstore:
-                # 使用 filter 进行用户过滤
-                from qdrant_client.models import Filter, FieldCondition, MatchValue
-                
-                l2_docs = await asyncio.to_thread(
-                    self.l2_vectorstore.similarity_search_with_score,
-                    query, top_k,
-                    filter=Filter(
-                        must=[
-                            FieldCondition(
-                                key="user_id",
-                                match=MatchValue(value=user_id)
-                            )
-                        ]
-                    )
+                matches = await asyncio.to_thread(
+                    self.l2_vectorstore.similarity_search_with_relevance_scores,
+                    query,
+                    k=top_k,
+                    filter=self._user_filter(user_id),
                 )
-                
-                for doc, score in l2_docs:
-                    results.append({
-                        "id": doc.metadata.get("paper_id", ""),
-                        "score": score * vector_weight,
-                        "payload": {
-                            "paper_id": doc.metadata.get("paper_id", ""),
-                            "title": doc.metadata.get("title", ""),
-                            "abstract": doc.metadata.get("abstract", ""),
-                            "user_id": doc.metadata.get("user_id", ""),
-                            **doc.metadata
-                        },
-                        "collection_type": "l2"
-                    })
-            
-            # 关键词匹配加分
+                results.extend(
+                    self._format_matches(matches, "l2", vector_weight)
+                )
+
             for result in results:
                 payload = result["payload"]
                 keyword_score = self._calculate_keyword_score(
-                    query, 
-                    f"{payload.get('title', '')} {payload.get('abstract', '')}"
+                    query,
+                    f"{payload.get('title', '')} {payload.get('abstract', '')}",
                 )
                 result["score"] += keyword_score * keyword_weight
-            
-            # 按分数排序并返回top_k
-            results.sort(key=lambda x: x["score"], reverse=True)
+
+            results.sort(key=lambda item: item["score"], reverse=True)
             return results[:top_k]
-            
-        except Exception as e:
-            raise VectorStoreException(f"混合搜索失败: {str(e)}")
-    
-    def _calculate_keyword_score(self, query: str, content: str) -> float:
-        """计算关键词匹配分数"""
+        except Exception as exc:
+            raise VectorStoreException(f"混合搜索失败: {exc}") from exc
+
+    @staticmethod
+    def _format_matches(matches, collection_type: str, vector_weight: float):
+        formatted = []
+        for document, relevance in matches:
+            metadata = document.metadata
+            formatted.append(
+                {
+                    "id": metadata.get("paper_id", ""),
+                    "score": max(0.0, min(1.0, float(relevance))) * vector_weight,
+                    "payload": {
+                        "paper_id": metadata.get("paper_id", ""),
+                        "title": metadata.get("title", ""),
+                        "abstract": metadata.get("abstract", ""),
+                        **metadata,
+                    },
+                    "collection_type": collection_type,
+                }
+            )
+        return formatted
+
+    @staticmethod
+    def _calculate_keyword_score(query: str, content: str) -> float:
         query_words = set(query.lower().split())
-        content_words = set(content.lower().split())
-        
         if not query_words:
             return 0.0
-        
-        intersection = query_words.intersection(content_words)
-        return len(intersection) / len(query_words)
-    
-    async def _generate_embedding(self, text: str) -> List[float]:
-        """生成文本向量"""
-        if self.embeddings:
-            return await self.embeddings.aembed_query(text)
-        else:
-            # 警告：降级为随机向量（embedding_service 未初始化）
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(
-                "Embedding 服务未初始化，使用随机向量替代。"
-                "请确保调用 vector_store_manager.initialize(embedding_service=...) 时传入了 embedding_service 参数。"
+        return len(query_words.intersection(content.lower().split())) / len(
+            query_words
+        )
+
+    async def get_user_vectors(
+        self, user_id: str, limit: int = 100
+    ) -> List[Dict]:
+        if self.backend == VectorDBType.PGVECTOR:
+            rows = await asyncio.to_thread(
+                self._pg_fetch_user_vectors, user_id, limit
             )
-            import random
-            return [random.random() for _ in range(1536)]
-    
-    async def get_user_vectors(self, user_id: str, limit: int = 100) -> List[Dict]:
-        """获取用户的向量数据"""
-        try:
-            user_filter = Filter(
-                must=[
-                    FieldCondition(
-                        key="user_id",
-                        match=MatchValue(value=user_id)
-                    )
-                ]
-            )
-            
-            results = self.client.scroll(
-                collection_name=self.l2_collection,
-                scroll_filter=user_filter,
-                limit=limit,
-                with_payload=True
-            )
-            
-            return [
-                {
-                    "id": point.id,
-                    "payload": point.payload
-                }
-                for point in results[0]
-            ]
-            
-        except Exception as e:
-            raise VectorStoreException(f"获取用户向量失败: {str(e)}")
-    
+            return [{"id": str(row[0]), "payload": row[1]} for row in rows]
+
+        results = await asyncio.to_thread(
+            self.client.scroll,
+            collection_name=self.l2_collection,
+            scroll_filter=self._user_filter(user_id),
+            limit=limit,
+            with_payload=True,
+        )
+        return [
+            {"id": str(point.id), "payload": point.payload}
+            for point in results[0]
+        ]
+
+    def _pg_fetch_user_vectors(self, user_id: str, limit: int):
+        import psycopg
+
+        query = """
+            SELECT embedding.id, embedding.cmetadata
+            FROM langchain_pg_embedding AS embedding
+            JOIN langchain_pg_collection AS collection
+              ON collection.uuid = embedding.collection_id
+            WHERE collection.name = %s
+              AND embedding.cmetadata ->> 'user_id' = %s
+            ORDER BY embedding.id
+            LIMIT %s
+        """
+        with psycopg.connect(self._psycopg_connection_string()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, (self.l2_collection, user_id, limit))
+                return cursor.fetchall()
+
     async def delete_user_vectors(self, user_id: str) -> bool:
-        """删除用户的所有向量数据"""
-        try:
-            user_filter = Filter(
-                must=[
-                    FieldCondition(
-                        key="user_id",
-                        match=MatchValue(value=user_id)
-                    )
-                ]
-            )
-            
-            self.client.delete(
-                collection_name=self.l2_collection,
-                points_selector=user_filter
-            )
-            
+        if self.backend == VectorDBType.PGVECTOR:
+            await asyncio.to_thread(self._pg_delete_user_vectors, user_id)
             return True
-            
-        except Exception as e:
-            raise VectorStoreException(f"删除用户向量失败: {str(e)}")
-    
-    async def get_collection_info(self, collection_type: str = "l1") -> CollectionInfo:
-        """获取集合信息"""
-        collection_name = self.l1_collection if collection_type == "l1" else self.l2_collection
-        return self.client.get_collection(collection_name)
-    
-    def get_retriever(self, collection_type: str = "l1", search_kwargs: Dict = None):
-        """获取 LangChain Retriever"""
-        vectorstore = self.l1_vectorstore if collection_type == "l1" else self.l2_vectorstore
-        
-        if not vectorstore:
-            raise VectorStoreException(f"{collection_type} 向量存储未初始化")
-        
-        search_kwargs = search_kwargs or {"k": 5}
-        return vectorstore.as_retriever(search_kwargs=search_kwargs)
-    
-    async def close(self):
-        """关闭向量数据库连接"""
-        if self.client:
-            self.client.close()
-    
-    def is_embedding_initialized(self) -> bool:
-        """检查 embedding 服务是否已初始化"""
-        return self.embeddings is not None
-    
-    def get_initialization_status(self) -> Dict[str, Any]:
-        """获取初始化状态诊断信息"""
+
+        from qdrant_client.models import FilterSelector
+
+        await asyncio.to_thread(
+            self.client.delete,
+            collection_name=self.l2_collection,
+            points_selector=FilterSelector(
+                filter=self._user_filter(user_id)
+            ),
+        )
+        return True
+
+    def _pg_delete_user_vectors(self, user_id: str) -> None:
+        import psycopg
+
+        query = """
+            DELETE FROM langchain_pg_embedding AS embedding
+            USING langchain_pg_collection AS collection
+            WHERE collection.uuid = embedding.collection_id
+              AND collection.name = %s
+              AND embedding.cmetadata ->> 'user_id' = %s
+        """
+        with psycopg.connect(self._psycopg_connection_string()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, (self.l2_collection, user_id))
+            connection.commit()
+
+    async def get_collection_info(self, collection_type: str = "l1"):
+        collection_name = (
+            self.l1_collection if collection_type == "l1" else self.l2_collection
+        )
+        if self.backend == VectorDBType.QDRANT:
+            return await asyncio.to_thread(
+                self.client.get_collection, collection_name
+            )
+        count = await asyncio.to_thread(
+            self._pg_collection_count, collection_name
+        )
         return {
-            "qdrant_client_ready": self.client is not None,
+            "backend": "pgvector",
+            "collection_name": collection_name,
+            "points_count": count,
+            "embedding_dimension": self.embedding_dimension,
+        }
+
+    def _pg_collection_count(self, collection_name: str) -> int:
+        import psycopg
+
+        query = """
+            SELECT count(*)
+            FROM langchain_pg_embedding AS embedding
+            JOIN langchain_pg_collection AS collection
+              ON collection.uuid = embedding.collection_id
+            WHERE collection.name = %s
+        """
+        with psycopg.connect(self._psycopg_connection_string()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, (collection_name,))
+                return cursor.fetchone()[0]
+
+    def get_retriever(
+        self, collection_type: str = "l1", search_kwargs: Dict = None
+    ):
+        vectorstore = (
+            self.l1_vectorstore if collection_type == "l1" else self.l2_vectorstore
+        )
+        if not vectorstore:
+            raise VectorStoreException(
+                f"{collection_type} 向量存储未初始化"
+            )
+        return vectorstore.as_retriever(
+            search_kwargs=search_kwargs or {"k": 5}
+        )
+
+    async def close(self):
+        if self.client:
+            await asyncio.to_thread(self.client.close)
+        for vectorstore in (self.l1_vectorstore, self.l2_vectorstore):
+            engine = getattr(vectorstore, "_engine", None)
+            if engine is not None:
+                await asyncio.to_thread(engine.dispose)
+        if self.embeddings:
+            self.embeddings.close()
+
+    def is_embedding_initialized(self) -> bool:
+        return self.embeddings is not None
+
+    def get_initialization_status(self) -> Dict[str, Any]:
+        return {
+            "backend": self.backend.value,
+            "client_ready": self.client is not None
+            if self.backend == VectorDBType.QDRANT
+            else self.l1_vectorstore is not None,
+            "qdrant_client_ready": (
+                self.client is not None
+                if self.backend == VectorDBType.QDRANT
+                else False
+            ),
             "l1_vectorstore_ready": self.l1_vectorstore is not None,
             "l2_vectorstore_ready": self.l2_vectorstore is not None,
             "embedding_service_ready": self.embeddings is not None,
-            "embedding_service_type": type(self.embeddings).__name__ if self.embeddings else "None"
+            "embedding_dimension": self.embedding_dimension,
         }
 
 
-# 全局向量存储管理器实例
 vector_store_manager = VectorStoreManager()

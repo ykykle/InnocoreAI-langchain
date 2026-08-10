@@ -74,3 +74,7 @@ PR.md
 QZY_README.md
 
 copilot/
+.agents/
+.claude/
+.lingma/
+.trae/

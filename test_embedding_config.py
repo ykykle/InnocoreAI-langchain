@@ -38,9 +38,9 @@ def test_embedding_config():
     print("\nLoaded Configuration:")
     print(f"  vector_db.embedding_model: {config.vector_db.embedding_model}")
     print(f"  vector_db.embedding_base_url: {config.vector_db.embedding_base_url}")
-    print(f"  vector_db.api_key: {'LOADED' if config.vector_db.api_key else 'NOT LOADED'}")
-    if config.vector_db.api_key:
-        print(f"    Prefix: {config.vector_db.api_key[:10]}...")
+    print(f"  vector_db.embedding_api_key: {'LOADED' if config.vector_db.embedding_api_key else 'NOT LOADED'}")
+    if config.vector_db.embedding_api_key:
+        print(f"    Prefix: {config.vector_db.embedding_api_key[:10]}...")
     
     print(f"\n  llm.api_key: {'LOADED' if config.llm.api_key else 'NOT LOADED'}")
     if config.llm.api_key:
@@ -49,9 +49,9 @@ def test_embedding_config():
     
     # Determine priority
     print("\nAPI Key Priority:")
-    if config.vector_db.api_key:
+    if config.vector_db.embedding_api_key:
         print(f"  Will use EMBEDDING_API_KEY")
-        print(f"    Value: {config.vector_db.api_key[:20]}...")
+        print(f"    Value: {config.vector_db.embedding_api_key[:20]}...")
     elif config.llm.api_key:
         print(f"  Will fallback to OPENAI_API_KEY")
         print(f"    Value: {config.llm.api_key[:20]}...")
