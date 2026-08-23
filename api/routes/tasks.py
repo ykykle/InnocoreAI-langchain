@@ -31,6 +31,9 @@ class TaskResponse(BaseModel):
     started_at: Optional[str]
     completed_at: Optional[str]
     priority: int
+    owner: Optional[str] = None
+    completed_by: Optional[str] = None
+    retry_count: int = 0
 
 # WebSocket连接管理
 class ConnectionManager:
@@ -57,7 +60,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-@router.post("/submit", response_model=Dict[str, Any])
+@router.post("/submit", response_model=Dict[str, Any], status_code=202)
 async def submit_task(request: TaskSubmitRequest):
     """提交任务"""
     try:
@@ -85,6 +88,21 @@ async def submit_task(request: TaskSubmitRequest):
     except Exception as e:
         logger.error(f"提交任务失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/agents/status", response_model=Dict[str, Any])
+async def get_agents_status():
+    """获取智能体及任务后端状态。"""
+    try:
+        status = await agent_controller.get_agent_status()
+        return {
+            "success": True,
+            "agents": status
+        }
+    except Exception as e:
+        logger.error(f"获取智能体状态失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/{task_id}/execute", response_model=Dict[str, Any])
 async def execute_task(task_id: str):
@@ -137,50 +155,25 @@ async def cancel_task(task_id: str):
 async def list_tasks():
     """获取任务列表"""
     try:
-        # 获取活跃任务
-        active_tasks = []
-        for task_id, task in agent_controller.active_tasks.items():
-            active_tasks.append(TaskResponse(
+        tasks = await agent_controller.list_tasks(limit=50)
+        return [
+            TaskResponse(
                 id=task["id"],
-                type=task["type"].value,
-                status=task["status"].value,
-                created_at=task["created_at"].isoformat(),
-                started_at=task["started_at"].isoformat() if task["started_at"] else None,
-                completed_at=task["completed_at"].isoformat() if task["completed_at"] else None,
-                priority=task["priority"]
-            ))
-        
-        # 获取历史任务（最近50个）
-        history_tasks = []
-        for task in agent_controller.task_history[-50:]:
-            history_tasks.append(TaskResponse(
-                id=task["id"],
-                type=task["type"].value,
-                status=task["status"].value,
-                created_at=task["created_at"].isoformat(),
-                started_at=task["started_at"].isoformat() if task["started_at"] else None,
-                completed_at=task["completed_at"].isoformat() if task["completed_at"] else None,
-                priority=task["priority"]
-            ))
-        
-        return active_tasks + history_tasks
+                type=task["type"],
+                status=task["status"],
+                created_at=task["created_at"],
+                started_at=task.get("started_at"),
+                completed_at=task.get("completed_at"),
+                priority=int(task["priority"]),
+                owner=task.get("owner"),
+                completed_by=task.get("completed_by"),
+                retry_count=int(task.get("retry_count", 0)),
+            )
+            for task in tasks
+        ]
         
     except Exception as e:
         logger.error(f"获取任务列表失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/agents/status", response_model=Dict[str, Any])
-async def get_agents_status():
-    """获取智能体状态"""
-    try:
-        status = await agent_controller.get_agent_status()
-        return {
-            "success": True,
-            "agents": status
-        }
-        
-    except Exception as e:
-        logger.error(f"获取智能体状态失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/workflow/full", response_model=Dict[str, Any])
@@ -206,40 +199,6 @@ async def run_full_workflow(input_data: Dict[str, Any]):
     except Exception as e:
         logger.error(f"运行完整工作流失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@router.websocket("/ws/{task_id}")
-async def websocket_task_updates(websocket: WebSocket, task_id: str):
-    """WebSocket任务更新"""
-    await manager.connect(websocket)
-    try:
-        # 发送初始状态
-        status = await agent_controller.get_task_status(task_id)
-        if status:
-            await manager.send_personal_message(
-                json.dumps({"type": "status", "data": status}),
-                websocket
-            )
-        
-        # 监听任务状态变化
-        while True:
-            await asyncio.sleep(1)  # 每秒检查一次
-            
-            status = await agent_controller.get_task_status(task_id)
-            if status:
-                await manager.send_personal_message(
-                    json.dumps({"type": "status", "data": status}),
-                    websocket
-                )
-                
-                # 如果任务完成，断开连接
-                if status["status"] in ["completed", "failed", "cancelled"]:
-                    break
-    
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception as e:
-        logger.error(f"WebSocket连接异常: {str(e)}")
-        manager.disconnect(websocket)
 
 @router.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
@@ -267,6 +226,37 @@ async def websocket_stream(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket流式通信异常: {str(e)}")
         manager.disconnect(websocket)
+
+
+@router.websocket("/ws/{task_id}")
+async def websocket_task_updates(websocket: WebSocket, task_id: str):
+    """WebSocket任务更新"""
+    await manager.connect(websocket)
+    try:
+        status = await agent_controller.get_task_status(task_id)
+        if status:
+            await manager.send_personal_message(
+                json.dumps({"type": "status", "data": status}),
+                websocket
+            )
+
+        while True:
+            await asyncio.sleep(1)
+            status = await agent_controller.get_task_status(task_id)
+            if status:
+                await manager.send_personal_message(
+                    json.dumps({"type": "status", "data": status}),
+                    websocket
+                )
+                if status["status"] in ["completed", "failed", "cancelled"]:
+                    break
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket连接异常: {str(e)}")
+        manager.disconnect(websocket)
+
 
 async def handle_writing_assistance(websocket: WebSocket, data: Dict[str, Any]):
     """处理写作辅助请求"""

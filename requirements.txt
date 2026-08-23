@@ -14,7 +14,7 @@ starlette==0.50.0
 # ============================================================
 sqlalchemy==2.0.44
 asyncpg==0.30.0
-redis==7.1.0
+redis==7.0.1
 
 # ============================================================
 # LangChain Framework - LLM Application Development

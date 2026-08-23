@@ -2,7 +2,7 @@
 InnoCore API 主应用
 """
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
@@ -81,24 +81,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"向量存储初始化失败（将以无向量存储模式运行）: {str(e)}")
 
-    # 初始化 Redis（可选）
-    try:
-        from core.redis_manager import redis_manager
-        await redis_manager.initialize()
-        logger.info("Redis 初始化完成")
-    except Exception as e:
-        logger.warning(f"Redis 初始化失败（将以无缓存模式运行）: {str(e)}")
-    
-    # 初始化智能体控制器（可选）
+    # 初始化智能体控制器。local 模式不依赖 Redis；redis 模式连接失败时拒绝启动。
     try:
         await agent_controller.initialize()
         logger.info("智能体控制器初始化完成")
-        
-        # 启动任务处理器
+
         import asyncio
-        asyncio.create_task(agent_controller.start_task_processor())
-        logger.info("任务处理器已启动")
+        app.state.task_processor = asyncio.create_task(
+            agent_controller.start_task_processor()
+        )
     except Exception as e:
+        if get_config().task_queue.backend == "redis":
+            logger.exception("Redis 分布式任务调度初始化失败")
+            raise
         logger.warning(f"智能体控制器初始化失败: {str(e)}")
     
     logger.info("InnoCore AI 启动完成")
@@ -107,14 +102,14 @@ async def lifespan(app: FastAPI):
     
     # 关闭时清理
     logger.info("正在关闭InnoCore AI...")
+    task_processor = getattr(app.state, "task_processor", None)
+    if task_processor:
+        task_processor.cancel()
+        import asyncio
+        await asyncio.gather(task_processor, return_exceptions=True)
     await agent_controller.shutdown()
     await db_manager.close()
     await vector_store_manager.close()
-    try:
-        from core.redis_manager import redis_manager
-        await redis_manager.close()
-    except Exception:
-        pass
     logger.info("InnoCore AI已关闭")
 
 # 创建FastAPI应用
@@ -189,6 +184,11 @@ async def health_check():
             "components": {
                 "database": "connected",
                 "vector_store": vector_store_manager.get_initialization_status(),
+                "task_queue": {
+                    "backend": agent_status["task_backend"],
+                    "redis_available": agent_status["redis_available"],
+                    "worker_enabled": agent_status["worker_enabled"],
+                },
                 "agents": agent_status
             }
         }

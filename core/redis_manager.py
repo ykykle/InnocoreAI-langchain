@@ -23,23 +23,52 @@ class RedisManager:
 
     def __init__(self):
         self.config = get_config().redis
-        self.redis: Optional[aioredis.Redis] = None
+        self.redis: Optional[Any] = None
+        self._initialize_lock = None
 
     async def initialize(self):
         if not HAS_REDIS:
-            logger.warning("redis 未安装，Redis 功能不可用")
-            return
-        url = "redis://"
-        if self.config.password:
-            url += f":{self.config.password}@"
-        url += f"{self.config.host}:{self.config.port}/{self.config.db}"
-        self.redis = await aioredis.from_url(
-            url,
-            max_connections=self.config.max_connections,
-            decode_responses=True,
-        )
-        await self.redis.ping()
-        logger.info(f"Redis 初始化完成: {self.config.host}:{self.config.port}")
+            raise RuntimeError("redis 包未安装，Redis 功能不可用")
+
+        # asyncio primitives should be created in the active event loop.
+        if self._initialize_lock is None:
+            import asyncio
+            self._initialize_lock = asyncio.Lock()
+
+        async with self._initialize_lock:
+            if self.redis is not None:
+                await self.redis.ping()
+                return
+
+            common_options = {
+                "max_connections": self.config.max_connections,
+                "decode_responses": True,
+                "socket_connect_timeout": self.config.socket_connect_timeout,
+                "socket_timeout": self.config.socket_timeout,
+                "health_check_interval": self.config.health_check_interval,
+            }
+            if self.config.url:
+                client = aioredis.from_url(self.config.url, **common_options)
+            else:
+                client = aioredis.Redis(
+                    host=self.config.host,
+                    port=self.config.port,
+                    db=self.config.db,
+                    password=self.config.password,
+                    **common_options,
+                )
+            try:
+                await client.ping()
+            except Exception:
+                await client.aclose()
+                raise
+            self.redis = client
+            logger.info(
+                "Redis 初始化完成: %s:%s/%s",
+                self.config.host,
+                self.config.port,
+                self.config.db,
+            )
 
     def _ensure_redis(self):
         """确保 Redis 可用"""
@@ -130,7 +159,8 @@ class RedisManager:
 
     async def close(self):
         if self.redis:
-            await self.redis.close()
+            await self.redis.aclose()
+            self.redis = None
             logger.info("Redis 连接已关闭")
 
 

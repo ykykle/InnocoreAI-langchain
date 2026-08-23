@@ -3,7 +3,7 @@
 """
 
 from fastapi import APIRouter, HTTPException
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from pydantic import BaseModel
 import logging
 from agents.controller import agent_controller, TaskType
@@ -212,12 +212,24 @@ async def search_and_analyze(request: WorkflowRequest):
 async def get_workflow_status(workflow_id: str):
     """获取工作流状态"""
     try:
+        task = await agent_controller.get_task_status(workflow_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="工作流不存在")
+        progress_by_status = {
+            "pending": 0,
+            "running": 50,
+            "completed": 100,
+            "failed": 100,
+            "cancelled": 100,
+        }
         return {
             "workflow_id": workflow_id,
-            "status": "completed",
-            "progress": 100,
-            "message": "工作流已完成"
+            "status": task["status"],
+            "progress": progress_by_status.get(task["status"], 0),
+            "message": f"工作流状态: {task['status']}",
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取工作流状态失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

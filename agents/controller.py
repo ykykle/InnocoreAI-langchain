@@ -6,17 +6,21 @@ InnoCore AI 智能体控制器 - LangGraph 多智能体编排
 import asyncio
 import json
 import logging
-from datetime import datetime
+import os
+import socket
+from contextlib import suppress
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
+from uuid import uuid4
 
-from agents.base import BaseAgent
 from agents.coach import CoachAgent
 from agents.hunter import HunterAgent
 from agents.miner import MinerAgent
 from agents.validator import ValidatorAgent
 from core.config import get_config
 from core.exceptions import AgentException
+from core.task_queue import TaskQueueBackend, create_task_backend, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +31,7 @@ class TaskType(Enum):
     WRITING_ASSISTANCE = "writing_assistance"
     CITATION_VALIDATION = "citation_validation"
     FULL_WORKFLOW = "full_workflow"
+    AUTONOMOUS_RESEARCH = "autonomous_research"
 
 
 class TaskStatus(Enum):
@@ -38,7 +43,7 @@ class TaskStatus(Enum):
 
 
 class AgentController:
-    """智能体控制器 - Redis 任务队列 + PostgreSQL 执行日志"""
+    """智能体控制器，支持进程内和 Redis 分布式任务调度。"""
 
     def __init__(self):
         self.config = get_config()
@@ -50,16 +55,15 @@ class AgentController:
             "validator": ValidatorAgent(),
         }
 
-        # 内存任务管理（降级方案）
-        self.active_tasks: Dict[str, Dict] = {}
-        self.task_history: List[Dict] = []
-        self.task_queue: asyncio.Queue = asyncio.Queue()
-
-        # 并发控制
+        self.task_backend: Optional[TaskQueueBackend] = None
         self.semaphore = asyncio.Semaphore(self.config.concurrent_agents)
-
-        # Redis 是否可用
         self._redis_available = False
+        self._initialized = False
+        self._shutdown_event = asyncio.Event()
+        self._callbacks: Dict[str, Callable] = {}
+        self.instance_id = self.config.task_queue.instance_id or (
+            f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
+        )
 
         # 事件回调
         self.event_callbacks: Dict[str, List[Callable]] = {
@@ -71,80 +75,138 @@ class AgentController:
 
     async def initialize(self):
         """初始化控制器"""
+        if self._initialized:
+            return
         logger.info("初始化 Agent Controller...")
-        try:
-            from core.redis_manager import redis_manager
-            await redis_manager.initialize()
-            self._redis_available = True
-            logger.info("Agent Controller 使用 Redis 任务队列")
-        except Exception as e:
-            logger.warning(f"Redis 不可用，使用内存任务队列: {str(e)}")
-            self._redis_available = False
-        logger.info("Agent Controller 初始化完成")
+        self.task_backend = create_task_backend()
+        await self.task_backend.initialize()
+        self._redis_available = self.task_backend.name == "redis"
+        self._initialized = True
+        logger.info(
+            "Agent Controller 初始化完成: backend=%s, worker=%s, instance=%s",
+            self.task_backend.name,
+            self.config.task_queue.worker_enabled,
+            self.instance_id,
+        )
+
+    async def _ensure_initialized(self) -> None:
+        if not self._initialized:
+            await self.initialize()
 
     async def submit_task(
         self, task_type: TaskType, input_data: Dict[str, Any],
         priority: int = 0, callback: Callable = None,
+        task_id: Optional[str] = None,
     ) -> str:
         """提交任务到队列"""
-        task_id = f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{len(self.active_tasks)}"
-
+        await self._ensure_initialized()
+        task_id = task_id or (
+            f"task_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}_"
+            f"{uuid4().hex[:8]}"
+        )
         task = {
             "id": task_id,
-            "type": task_type,
+            "type": task_type.value,
             "input_data": input_data,
-            "status": TaskStatus.PENDING,
-            "priority": priority,
-            "callback": callback,
-            "created_at": datetime.now(),
+            "status": TaskStatus.PENDING.value,
+            "priority": int(priority),
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
             "started_at": None,
             "completed_at": None,
             "result": None,
             "error": None,
-            "agent_results": {},
+            "owner": None,
+            "completed_by": None,
+            "lease_token": None,
+            "lease_until": None,
+            "retry_count": 0,
+            "max_retries": self.config.task_queue.max_retries,
+            "events": [],
         }
-
-        self.active_tasks[task_id] = task
-
-        if self._redis_available:
-            try:
-                from core.redis_manager import redis_manager
-                await redis_manager.push_task("task_queue", task_id, priority)
-                await redis_manager.set_active_task(task_id, task)
-            except Exception:
-                pass
-
-        await self.task_queue.put((priority, task))
+        if callback:
+            if self.task_backend.name == "redis":
+                raise AgentException(
+                    "分布式任务不支持进程内 callback，请使用任务状态或事件接口"
+                )
+            self._callbacks[task_id] = callback
+        await self.task_backend.submit(task)
         logger.info(f"任务已提交: {task_id}, 类型: {task_type.value}")
         return task_id
 
     async def execute_task(self, task_id: str) -> Dict[str, Any]:
-        """执行单个任务"""
-        if task_id not in self.active_tasks:
+        """执行或等待任务，兼容原有同步业务路由。"""
+        await self._ensure_initialized()
+        task = await self.task_backend.get(task_id)
+        if not task:
             raise AgentException(f"任务不存在: {task_id}")
+        if task["status"] == TaskStatus.COMPLETED.value:
+            return task.get("result") or {}
+        if task["status"] in {TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}:
+            raise AgentException(task.get("error") or f"任务已{task['status']}")
 
-        task = self.active_tasks[task_id]
+        # Redis 模式由 Worker 独占执行权；HTTP 进程只等待共享状态。
+        if self.task_backend.name == "redis":
+            return await self.wait_for_task(task_id)
 
-        # 防止重复执行：如果任务已在执行或已完成，直接返回
-        if task["status"] != TaskStatus.PENDING:
-            logger.warning(f"任务 {task_id} 已在执行或已完成 (状态: {task['status'].value})，跳过重复执行")
-            if task["status"] == TaskStatus.COMPLETED:
-                return task.get("result", {})
-            raise AgentException(f"任务 {task_id} 已在执行中")
+        claimed = await self.task_backend.claim_task(task_id, self.instance_id)
+        if claimed:
+            task, lease_token = claimed
+            try:
+                return await self._execute_claimed_task(
+                    task, lease_token, self.instance_id
+                )
+            except AgentException:
+                current = await self.task_backend.get(task_id)
+                if current and current["status"] == TaskStatus.PENDING.value:
+                    return await self.wait_for_task(task_id)
+                raise
+        return await self.wait_for_task(task_id)
 
+    async def submit_and_wait(
+        self, task_type: TaskType, input_data: Dict[str, Any], priority: int = 0
+    ) -> Dict[str, Any]:
+        task_id = await self.submit_task(task_type, input_data, priority)
+        return await self.execute_task(task_id)
+
+    async def wait_for_task(
+        self, task_id: str, timeout: Optional[float] = None
+    ) -> Dict[str, Any]:
+        deadline = asyncio.get_running_loop().time() + (
+            timeout or self.config.task_queue.wait_timeout
+        )
+        poll_seconds = self.config.task_queue.poll_interval_ms / 1000
+        while asyncio.get_running_loop().time() < deadline:
+            task = await self.task_backend.get(task_id)
+            if not task:
+                raise AgentException(f"任务不存在: {task_id}")
+            if task["status"] == TaskStatus.COMPLETED.value:
+                return task.get("result") or {}
+            if task["status"] == TaskStatus.FAILED.value:
+                raise AgentException(task.get("error") or "任务执行失败")
+            if task["status"] == TaskStatus.CANCELLED.value:
+                raise AgentException("任务已取消")
+            await asyncio.sleep(poll_seconds)
+        raise AgentException(f"等待任务超时: {task_id}")
+
+    async def _execute_claimed_task(
+        self, task: Dict[str, Any], lease_token: str, worker_id: str
+    ) -> Dict[str, Any]:
+        task_id = task["id"]
         async with self.semaphore:
-            task["status"] = TaskStatus.RUNNING
-            start_time = datetime.now()
-            task["started_at"] = start_time
+            start_time = datetime.now(timezone.utc)
+            task.setdefault("agent_results", {})
             await self._trigger_event("task_started", task)
+            heartbeat = asyncio.create_task(
+                self._heartbeat_task(task_id, lease_token, worker_id)
+            )
 
-            # 记录 Agent 执行开始
             exec_id = None
             try:
                 from core.database import db_manager
                 exec_id = await db_manager.log_agent_execution(
                     agent_name="controller",
-                    task_type=task["type"].value,
+                    task_type=task["type"],
                     task_id=task_id,
                     input_summary=json.dumps(task["input_data"], ensure_ascii=False)[:500],
                 )
@@ -153,11 +215,21 @@ class AgentController:
 
             try:
                 result = await self._dispatch_task(task)
-                duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-
-                task["status"] = TaskStatus.COMPLETED
-                task["completed_at"] = datetime.now()
-                task["result"] = result
+                duration_ms = int(
+                    (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+                )
+                persisted = await self.task_backend.complete(
+                    task_id, worker_id, lease_token, result
+                )
+                if not persisted:
+                    raise AgentException(
+                        f"任务 {task_id} 租约已失效或任务已取消，结果未提交"
+                    )
+                task.update(
+                    status=TaskStatus.COMPLETED.value,
+                    completed_at=utc_now(),
+                    result=result,
+                )
 
                 if exec_id:
                     try:
@@ -171,15 +243,30 @@ class AgentController:
                         pass
 
                 await self._trigger_event("task_completed", task)
-                if task.get("callback"):
-                    await task["callback"](task)
+                callback = self._callbacks.pop(task_id, None)
+                if callback:
+                    try:
+                        callback_result = callback(task)
+                        if asyncio.iscoroutine(callback_result):
+                            await callback_result
+                    except Exception:
+                        logger.exception("任务完成回调失败: task_id=%s", task_id)
 
                 return result
 
             except Exception as e:
-                duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-                task["status"] = TaskStatus.FAILED
-                task["completed_at"] = datetime.now()
+                duration_ms = int(
+                    (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+                )
+                outcome = await self.task_backend.fail(
+                    task_id, worker_id, lease_token, str(e)
+                )
+                task["status"] = (
+                    TaskStatus.PENDING.value
+                    if outcome == "retry"
+                    else TaskStatus.FAILED.value
+                )
+                task["completed_at"] = utc_now() if outcome == "failed" else None
                 task["error"] = str(e)
 
                 if exec_id:
@@ -196,15 +283,20 @@ class AgentController:
                 raise AgentException(f"任务执行失败: {str(e)}")
 
             finally:
-                self.task_history.append(task.copy())
-                del self.active_tasks[task_id]
-                if self._redis_available:
-                    try:
-                        from core.redis_manager import redis_manager
-                        await redis_manager.remove_active_task(task_id)
-                        await redis_manager.push_task_history(task)
-                    except Exception:
-                        pass
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
+
+    async def _heartbeat_task(
+        self, task_id: str, lease_token: str, worker_id: str
+    ) -> None:
+        while True:
+            await asyncio.sleep(self.config.task_queue.heartbeat_seconds)
+            renewed = await self.task_backend.heartbeat(
+                task_id, worker_id, lease_token
+            )
+            if not renewed:
+                return
 
     async def _dispatch_task(self, task: Dict) -> Dict[str, Any]:
         """分发任务到对应 Agent"""
@@ -214,8 +306,13 @@ class AgentController:
             TaskType.WRITING_ASSISTANCE: self._execute_writing_assistance,
             TaskType.CITATION_VALIDATION: self._execute_citation_validation,
             TaskType.FULL_WORKFLOW: self._execute_full_workflow,
+            TaskType.AUTONOMOUS_RESEARCH: self._execute_autonomous_research,
         }
-        handler = dispatch_map.get(task["type"])
+        try:
+            task_type = TaskType(task["type"])
+        except ValueError as exc:
+            raise AgentException(f"不支持的任务类型: {task['type']}") from exc
+        handler = dispatch_map.get(task_type)
         if not handler:
             raise AgentException(f"不支持的任务类型: {task['type']}")
         return await handler(task)
@@ -259,6 +356,35 @@ class AgentController:
             "validation_result": result,
             "paper_info": task["input_data"].get("paper_info"),
         }
+
+    async def _execute_autonomous_research(self, task: Dict) -> Dict[str, Any]:
+        from agents.autonomous import AutonomousResearchGraph
+
+        input_data = task["input_data"]
+
+        async def progress(kind: str, message: str, data: Dict[str, Any]):
+            await self.append_task_event(
+                task["id"],
+                {
+                    "time": utc_now(),
+                    "type": kind,
+                    "message": message,
+                    "data": data,
+                },
+            )
+
+        try:
+            graph = AutonomousResearchGraph(self.agents)
+            result = await graph.run(
+                input_data["message"],
+                input_data.get("thread_id") or task["id"],
+                input_data.get("context", {}),
+                progress,
+            )
+            return {"answer": result["answer"], "result": result}
+        except Exception as exc:
+            await progress("failed", f"Execution failed: {exc}", {})
+            raise
 
     async def _execute_full_workflow(self, task: Dict) -> Dict[str, Any]:
         """执行完整工作流: Hunter -> Miner(xN) -> Validator -> Coach"""
@@ -311,14 +437,20 @@ class AgentController:
                         "authors": paper.get("authors", []), "user_id": user_id, "analysis_type": "full",
                     }
                 if miner_input:
-                    logger.info(f"[Workflow] 提交 MinerAgent 分析: %s", paper.get("title", "")[:60])
+                    logger.info(
+                        "[Workflow] 提交 MinerAgent 分析: %s",
+                        paper.get("title", "")[:60],
+                    )
                     analysis_tasks.append(self.agents["miner"].run(miner_input))
                 else:
-                    logger.warning(f"[Workflow] 跳过论文（缺少可用的标识符）: %s", paper.get("title", "")[:60])
+                    logger.warning(
+                        "[Workflow] 跳过论文（缺少可用的标识符）: %s",
+                        paper.get("title", "")[:60],
+                    )
 
             if analysis_tasks:
                 analyses = await asyncio.gather(*analysis_tasks, return_exceptions=True)
-                for i, analysis in enumerate(analyses):
+                for analysis in analyses:
                     if isinstance(analysis, Exception):
                         logger.warning(f"[Workflow] Miner 分析失败: {str(analysis)}")
                     else:
@@ -368,59 +500,112 @@ class AgentController:
 
     async def start_task_processor(self):
         """启动后台任务处理器"""
-        logger.info("任务处理器已启动")
-        while True:
+        await self._ensure_initialized()
+        if not self.config.task_queue.worker_enabled:
+            logger.info("当前实例未启用任务 Worker")
+            return
+        logger.info(
+            "任务处理器已启动: workers=%s, backend=%s",
+            self.config.concurrent_agents,
+            self.task_backend.name,
+        )
+        workers = [
+            asyncio.create_task(self._worker_loop(index))
+            for index in range(self.config.concurrent_agents)
+        ]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+    async def _worker_loop(self, index: int) -> None:
+        worker_id = f"{self.instance_id}:worker-{index}"
+        poll_seconds = self.config.task_queue.poll_interval_ms / 1000
+        while not self._shutdown_event.is_set():
             try:
-                priority, task = await self.task_queue.get()
-                task_id = task["id"]
-                # 跳过已被同步执行器处理完的任务
-                if task_id not in self.active_tasks or self.active_tasks[task_id]["status"] != TaskStatus.PENDING:
+                if hasattr(self.task_backend, "heartbeat_worker"):
+                    await self.task_backend.heartbeat_worker(worker_id)
+                claimed = await self.task_backend.claim_next(worker_id)
+                if not claimed:
+                    await asyncio.sleep(poll_seconds)
                     continue
-                asyncio.create_task(self.execute_task(task_id))
+                task, lease_token = claimed
+                await self._execute_claimed_task_for_worker(
+                    task, lease_token, worker_id
+                )
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.error(f"任务处理器异常: {str(e)}")
+                logger.exception("任务处理器异常: worker=%s, error=%s", worker_id, e)
                 await asyncio.sleep(1)
+
+    async def _execute_claimed_task_for_worker(
+        self, task: Dict[str, Any], lease_token: str, worker_id: str
+    ) -> None:
+        try:
+            await self._execute_claimed_task(task, lease_token, worker_id)
+        except AgentException:
+            # Failure state and retries are handled by _execute_claimed_task.
+            pass
 
     async def get_task_status(self, task_id: str) -> Optional[Dict]:
         """获取任务状态"""
-        task = self.active_tasks.get(task_id)
-        if not task:
-            for t in self.task_history:
-                if t["id"] == task_id:
-                    task = t
-                    break
+        await self._ensure_initialized()
+        task = await self.task_backend.get(task_id)
         if not task:
             return None
         return {
             "id": task["id"],
-            "type": task["type"].value,
-            "status": task["status"].value,
-            "created_at": task["created_at"].isoformat(),
-            "started_at": task["started_at"].isoformat() if task["started_at"] else None,
-            "completed_at": task["completed_at"].isoformat() if task["completed_at"] else None,
+            "type": task["type"],
+            "status": task["status"],
+            "created_at": task["created_at"],
+            "started_at": task.get("started_at"),
+            "completed_at": task.get("completed_at"),
             "priority": task["priority"],
+            "owner": task.get("owner"),
+            "completed_by": task.get("completed_by"),
+            "retry_count": task.get("retry_count", 0),
         }
 
+    async def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        await self._ensure_initialized()
+        return await self.task_backend.get(task_id)
+
+    async def list_tasks(self, limit: int = 50) -> List[Dict[str, Any]]:
+        await self._ensure_initialized()
+        return await self.task_backend.list(limit)
+
+    async def append_task_event(self, task_id: str, event: Dict[str, Any]) -> None:
+        await self._ensure_initialized()
+        await self.task_backend.append_event(task_id, event)
+
     async def cancel_task(self, task_id: str) -> bool:
-        if task_id in self.active_tasks and self.active_tasks[task_id]["status"] == TaskStatus.PENDING:
-            task = self.active_tasks[task_id]
-            task["status"] = TaskStatus.CANCELLED
-            task["completed_at"] = datetime.now()
-            self.task_history.append(task.copy())
-            del self.active_tasks[task_id]
+        await self._ensure_initialized()
+        cancelled = await self.task_backend.cancel(task_id)
+        if cancelled:
             logger.info(f"任务已取消: {task_id}")
-            return True
-        return False
+        return cancelled
 
     async def get_agent_status(self) -> Dict[str, Any]:
+        await self._ensure_initialized()
         agent_status = {name: agent.get_status() for name, agent in self.agents.items()}
+        tasks = await self.task_backend.list(100)
         return {
             "agents": agent_status,
-            "active_tasks": len(self.active_tasks),
-            "queued_tasks": self.task_queue.qsize(),
-            "completed_tasks": len(self.task_history),
+            "active_tasks": sum(
+                task["status"] == TaskStatus.RUNNING.value for task in tasks
+            ),
+            "queued_tasks": await self.task_backend.queue_size(),
+            "completed_tasks": sum(
+                task["status"] == TaskStatus.COMPLETED.value for task in tasks
+            ),
             "max_concurrent": self.config.concurrent_agents,
             "redis_available": self._redis_available,
+            "task_backend": self.task_backend.name,
+            "worker_enabled": self.config.task_queue.worker_enabled,
+            "instance_id": self.instance_id,
         }
 
     def add_event_callback(self, event_type: str, callback: Callable):
@@ -440,13 +625,10 @@ class AgentController:
     async def shutdown(self):
         """关闭控制器"""
         logger.info("关闭 Agent Controller...")
-        for task_id in list(self.active_tasks.keys()):
-            await self.cancel_task(task_id)
-        try:
-            from core.redis_manager import redis_manager
-            await redis_manager.close()
-        except Exception:
-            pass
+        self._shutdown_event.set()
+        if self.task_backend:
+            await self.task_backend.close()
+        self._initialized = False
         logger.info("Agent Controller 已关闭")
 
 

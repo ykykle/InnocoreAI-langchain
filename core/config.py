@@ -2,7 +2,7 @@
 InnoCore AI 核心配置模块
 """
 
-from typing import Dict, List, Optional, Any
+from typing import Dict, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 import os
@@ -71,11 +71,32 @@ class DatabaseConfig:
 @dataclass
 class RedisConfig:
     """Redis配置"""
+    url: Optional[str] = None
     host: str = "localhost"
     port: int = 6379
     db: int = 0
     password: Optional[str] = None
     max_connections: int = 20
+    socket_connect_timeout: float = 3.0
+    socket_timeout: float = 5.0
+    health_check_interval: int = 30
+
+
+@dataclass
+class TaskQueueConfig:
+    """任务调度配置。local 用于单实例，redis 用于多实例。"""
+    backend: str = "local"
+    worker_enabled: bool = True
+    instance_id: Optional[str] = None
+    key_prefix: str = "innocore:dev"
+    lease_seconds: int = 300
+    heartbeat_seconds: int = 30
+    max_retries: int = 3
+    metadata_ttl: int = 86400
+    result_ttl: int = 86400
+    history_maxlen: int = 1000
+    wait_timeout: int = 600
+    poll_interval_ms: int = 200
 
 @dataclass
 class ExternalAPIConfig:
@@ -107,6 +128,9 @@ class InnoCoreConfig:
     
     # Redis配置
     redis: RedisConfig = field(default_factory=RedisConfig)
+
+    # 任务调度配置
+    task_queue: TaskQueueConfig = field(default_factory=TaskQueueConfig)
     
     # 外部API配置
     external_apis: ExternalAPIConfig = field(default_factory=ExternalAPIConfig)
@@ -185,7 +209,55 @@ class InnoCoreConfig:
             os.getenv("EMBEDDING_API_KEY") or self.vector_db.embedding_api_key
         )
         self.database.password = self.database.password or os.getenv("DATABASE_PASSWORD")
-        self.redis.password = self.redis.password or os.getenv("REDIS_PASSWORD")
+        self.redis.url = os.getenv("REDIS_URL") or self.redis.url
+        self.redis.host = os.getenv("REDIS_HOST", self.redis.host)
+        self.redis.port = int(os.getenv("REDIS_PORT", str(self.redis.port)))
+        self.redis.db = int(os.getenv("REDIS_DB", str(self.redis.db)))
+        self.redis.password = os.getenv("REDIS_PASSWORD") or self.redis.password
+        self.redis.max_connections = int(os.getenv(
+            "REDIS_MAX_CONNECTIONS", str(self.redis.max_connections)
+        ))
+        self.redis.socket_connect_timeout = float(os.getenv(
+            "REDIS_CONNECT_TIMEOUT", str(self.redis.socket_connect_timeout)
+        ))
+        self.redis.socket_timeout = float(os.getenv(
+            "REDIS_SOCKET_TIMEOUT", str(self.redis.socket_timeout)
+        ))
+        self.redis.health_check_interval = int(os.getenv(
+            "REDIS_HEALTH_CHECK_INTERVAL", str(self.redis.health_check_interval)
+        ))
+
+        self.task_queue.backend = os.getenv(
+            "TASK_QUEUE_BACKEND", self.task_queue.backend
+        ).lower()
+        if self.task_queue.backend not in {"local", "redis"}:
+            raise ValueError("TASK_QUEUE_BACKEND 必须是 local 或 redis")
+        self.task_queue.worker_enabled = os.getenv(
+            "TASK_WORKER_ENABLED", str(self.task_queue.worker_enabled)
+        ).lower() == "true"
+        self.task_queue.instance_id = (
+            os.getenv("INSTANCE_ID") or self.task_queue.instance_id
+        )
+        self.task_queue.key_prefix = os.getenv(
+            "TASK_QUEUE_KEY_PREFIX", self.task_queue.key_prefix
+        )
+        for env_name, attr in (
+            ("TASK_LEASE_SECONDS", "lease_seconds"),
+            ("TASK_HEARTBEAT_SECONDS", "heartbeat_seconds"),
+            ("TASK_MAX_RETRIES", "max_retries"),
+            ("TASK_METADATA_TTL", "metadata_ttl"),
+            ("TASK_RESULT_TTL", "result_ttl"),
+            ("TASK_HISTORY_MAXLEN", "history_maxlen"),
+            ("TASK_WAIT_TIMEOUT", "wait_timeout"),
+            ("TASK_POLL_INTERVAL_MS", "poll_interval_ms"),
+        ):
+            setattr(
+                self.task_queue,
+                attr,
+                int(os.getenv(env_name, str(getattr(self.task_queue, attr)))),
+            )
+        if self.task_queue.heartbeat_seconds >= self.task_queue.lease_seconds:
+            raise ValueError("TASK_HEARTBEAT_SECONDS 必须小于 TASK_LEASE_SECONDS")
         
         self.external_apis.crossref_api_key = self.external_apis.crossref_api_key or os.getenv("CROSSREF_API_KEY")
         self.external_apis.google_scholar_api_key = self.external_apis.google_scholar_api_key or os.getenv("GOOGLE_SCHOLAR_API_KEY")
