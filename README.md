@@ -214,15 +214,16 @@ innocore_ai/
 
 - Python 3.8+
 - OpenAI API key (or compatible API)
-- Redis（多实例任务调度时必需；单实例默认不依赖）
+- Redis + PostgreSQL（多实例任务调度时必需；单实例默认不依赖）
 - Qdrant or PostgreSQL with pgvector (optional, for vector storage)
 
 向量数据库可通过 `VECTOR_DB_TYPE=qdrant|pgvector` 切换。配置、选型和
 Qdrant 到 pgvector 的迁移步骤见
 [向量数据库配置与迁移](docs/VECTOR_DATABASE_GUIDE.md)。
 
-任务调度通过 `TASK_QUEUE_BACKEND=local|redis` 切换。单实例默认使用
-`local`，多实例部署使用 `redis`；配置与验收步骤见
+任务调度通过 `TASK_QUEUE_BACKEND=local|redis_stream` 切换。单实例默认使用
+`local`，多实例部署使用 PostgreSQL 状态机与 Redis Stream consumer group；设计见
+[多用户并发安全设计](docs/MULTI_USER_TASK_EXECUTION.md)，配置与验收步骤见
 [Redis 多实例任务调度验收手册](docs/REDIS_TASK_SCHEDULING_ACCEPTANCE.md)。
 
 ## Development

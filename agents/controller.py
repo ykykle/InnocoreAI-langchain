@@ -19,7 +19,9 @@ from agents.hunter import HunterAgent
 from agents.miner import MinerAgent
 from agents.validator import ValidatorAgent
 from core.config import get_config
+from core.concurrency import concurrency_limiter
 from core.exceptions import AgentException
+from core.request_context import get_request_identity
 from core.task_queue import TaskQueueBackend, create_task_backend, utc_now
 
 logger = logging.getLogger(__name__)
@@ -80,7 +82,7 @@ class AgentController:
         logger.info("初始化 Agent Controller...")
         self.task_backend = create_task_backend()
         await self.task_backend.initialize()
-        self._redis_available = self.task_backend.name == "redis"
+        self._redis_available = self.task_backend.name == "redis_stream"
         self._initialized = True
         logger.info(
             "Agent Controller 初始化完成: backend=%s, worker=%s, instance=%s",
@@ -104,9 +106,28 @@ class AgentController:
             f"task_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}_"
             f"{uuid4().hex[:8]}"
         )
+        identity = get_request_identity()
+        input_data = dict(input_data)
+        # In local development an explicit user_id remains convenient. In
+        # authenticated mode the request identity always wins.
+        user_id = identity.user_id
+        if user_id == "anonymous" and input_data.get("user_id"):
+            user_id = str(input_data["user_id"])
+        input_data["user_id"] = user_id
+        agent_by_type = {
+            TaskType.PAPER_HUNTING: "hunter",
+            TaskType.PAPER_ANALYSIS: "miner",
+            TaskType.WRITING_ASSISTANCE: "coach",
+            TaskType.CITATION_VALIDATION: "validator",
+            TaskType.FULL_WORKFLOW: "controller",
+            TaskType.AUTONOMOUS_RESEARCH: "controller",
+        }
         task = {
             "id": task_id,
             "type": task_type.value,
+            "agent_type": agent_by_type[task_type],
+            "tenant_id": identity.tenant_id,
+            "user_id": user_id,
             "input_data": input_data,
             "status": TaskStatus.PENDING.value,
             "priority": int(priority),
@@ -125,7 +146,7 @@ class AgentController:
             "events": [],
         }
         if callback:
-            if self.task_backend.name == "redis":
+            if self.task_backend.name == "redis_stream":
                 raise AgentException(
                     "分布式任务不支持进程内 callback，请使用任务状态或事件接口"
                 )
@@ -140,13 +161,15 @@ class AgentController:
         task = await self.task_backend.get(task_id)
         if not task:
             raise AgentException(f"任务不存在: {task_id}")
+        if not self._owned_by_request(task):
+            raise AgentException(f"任务不存在: {task_id}")
         if task["status"] == TaskStatus.COMPLETED.value:
             return task.get("result") or {}
         if task["status"] in {TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}:
             raise AgentException(task.get("error") or f"任务已{task['status']}")
 
         # Redis 模式由 Worker 独占执行权；HTTP 进程只等待共享状态。
-        if self.task_backend.name == "redis":
+        if self.task_backend.name == "redis_stream":
             return await self.wait_for_task(task_id)
 
         claimed = await self.task_backend.claim_task(task_id, self.instance_id)
@@ -258,6 +281,26 @@ class AgentController:
                 duration_ms = int(
                     (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
                 )
+                current = await self.task_backend.get(task_id)
+                if current and current["status"] == "cancelling":
+                    await self.task_backend.fail(
+                        task_id, worker_id, lease_token, "task cancelled"
+                    )
+                    current = await self.task_backend.get(task_id)
+                if current and current["status"] == TaskStatus.CANCELLED.value:
+                    task.update(
+                        status=TaskStatus.CANCELLED.value,
+                        completed_at=current.get("completed_at"),
+                    )
+                    if exec_id:
+                        try:
+                            from core.database import db_manager
+                            await db_manager.update_agent_execution(
+                                exec_id, "cancelled", duration_ms=duration_ms,
+                            )
+                        except Exception:
+                            pass
+                    raise AgentException(f"任务已取消: {task_id}") from e
                 outcome = await self.task_backend.fail(
                     task_id, worker_id, lease_token, str(e)
                 )
@@ -317,8 +360,27 @@ class AgentController:
             raise AgentException(f"不支持的任务类型: {task['type']}")
         return await handler(task)
 
+    async def _run_agent(
+        self, agent_name: str, input_data: Dict[str, Any], task: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Run a singleton agent with isolated state and distributed limits."""
+        agent = self.agents[agent_name]
+        tenant_id = task.get("tenant_id", "default")
+        user_id = task.get("user_id") or input_data.get("user_id") or "anonymous"
+        async with concurrency_limiter.slot(
+            f"user:{tenant_id}:{user_id}", self.config.task_queue.user_concurrency
+        ):
+            if agent_name == "miner":
+                async with concurrency_limiter.slot(
+                    "agent:miner", self.config.task_queue.miner_concurrency
+                ):
+                    async with agent.execution_scope(f"{task['id']}:{agent_name}"):
+                        return await agent.run(input_data)
+            async with agent.execution_scope(f"{task['id']}:{agent_name}"):
+                return await agent.run(input_data)
+
     async def _execute_paper_hunting(self, task: Dict) -> Dict[str, Any]:
-        result = await self.agents["hunter"].run(task["input_data"])
+        result = await self._run_agent("hunter", task["input_data"], task)
         task["agent_results"]["hunter"] = result
         return {
             "task_type": "paper_hunting",
@@ -330,7 +392,7 @@ class AgentController:
         }
 
     async def _execute_paper_analysis(self, task: Dict) -> Dict[str, Any]:
-        result = await self.agents["miner"].run(task["input_data"])
+        result = await self._run_agent("miner", task["input_data"], task)
         task["agent_results"]["miner"] = result
         return {
             "task_type": "paper_analysis",
@@ -339,7 +401,7 @@ class AgentController:
         }
 
     async def _execute_writing_assistance(self, task: Dict) -> Dict[str, Any]:
-        result = await self.agents["coach"].run(task["input_data"])
+        result = await self._run_agent("coach", task["input_data"], task)
         task["agent_results"]["coach"] = result
         return {
             "task_type": "writing_assistance",
@@ -349,7 +411,7 @@ class AgentController:
         }
 
     async def _execute_citation_validation(self, task: Dict) -> Dict[str, Any]:
-        result = await self.agents["validator"].run(task["input_data"])
+        result = await self._run_agent("validator", task["input_data"], task)
         task["agent_results"]["validator"] = result
         return {
             "task_type": "citation_validation",
@@ -374,7 +436,12 @@ class AgentController:
             )
 
         try:
-            graph = AutonomousResearchGraph(self.agents)
+            graph = AutonomousResearchGraph(
+                self.agents,
+                agent_runner=lambda name, payload: self._run_agent(
+                    name, payload, task
+                ),
+            )
             result = await graph.run(
                 input_data["message"],
                 input_data.get("thread_id") or task["id"],
@@ -397,6 +464,7 @@ class AgentController:
             "stages": {},
             "final_papers": [],
             "analysis_reports": [],
+            "warnings": [],
         }
 
         # 记录工作流
@@ -413,11 +481,15 @@ class AgentController:
         try:
             # Stage 1: Hunter - 论文搜索
             logger.info("工作流 Stage 1: 论文搜索")
-            hunting_result = await self.agents["hunter"].run({
+            hunting_result = await self._run_agent("hunter", {
                 "keywords": keywords,
                 "max_papers": input_data.get("max_papers", 10),
                 "sources": input_data.get("sources", ["arxiv"]),
-            })
+            }, task)
+            if hunting_result.get("status") in {"failed", "error"}:
+                raise AgentException(
+                    f"Hunter 阶段失败: {hunting_result.get('error', 'unknown error')}"
+                )
             workflow_result["stages"]["hunting"] = hunting_result
             task["agent_results"]["hunter"] = hunting_result
             papers = hunting_result.get("papers", [])
@@ -441,7 +513,9 @@ class AgentController:
                         "[Workflow] 提交 MinerAgent 分析: %s",
                         paper.get("title", "")[:60],
                     )
-                    analysis_tasks.append(self.agents["miner"].run(miner_input))
+                    analysis_tasks.append(
+                        self._run_agent("miner", miner_input, task)
+                    )
                 else:
                     logger.warning(
                         "[Workflow] 跳过论文（缺少可用的标识符）: %s",
@@ -452,7 +526,17 @@ class AgentController:
                 analyses = await asyncio.gather(*analysis_tasks, return_exceptions=True)
                 for analysis in analyses:
                     if isinstance(analysis, Exception):
-                        logger.warning(f"[Workflow] Miner 分析失败: {str(analysis)}")
+                        warning = f"Miner 分析失败: {str(analysis)}"
+                        workflow_result["warnings"].append(warning)
+                        logger.warning("[Workflow] %s", warning)
+                    elif not isinstance(analysis, dict) or analysis.get("success") is not True:
+                        error = (
+                            analysis.get("error", "success flag is not true")
+                            if isinstance(analysis, dict) else "non-object response"
+                        )
+                        workflow_result["warnings"].append(
+                            f"Miner 返回无效分析: {error}"
+                        )
                     else:
                         workflow_result["analysis_reports"].append(analysis)
             else:
@@ -463,7 +547,7 @@ class AgentController:
                 logger.info("工作流 Stage 3: 引用校验")
                 for paper in papers:
                     try:
-                        v_result = await self.agents["validator"].run({
+                        v_result = await self._run_agent("validator", {
                             "paper_info": {
                                 "title": paper.get("title", ""),
                                 "authors": paper.get("authors", []),
@@ -472,10 +556,46 @@ class AgentController:
                             },
                             "formats": ["bibtex", "apa"],
                             "verify_external": True,
-                        })
+                        }, task)
+                        if v_result.get("status") in {"failed", "error"}:
+                            raise AgentException(
+                                v_result.get("error", "Validator returned failure")
+                            )
                         paper["citations"] = v_result.get("citations", {})
                     except Exception as e:
-                        logger.warning(f"引用校验失败: {str(e)}")
+                        warning = f"Validator 失败（不阻断工作流）: {str(e)}"
+                        workflow_result["warnings"].append(warning)
+                        logger.warning(warning)
+
+            # Stage 4: Coach only has a factual basis when at least one Miner
+            # report is valid. It is deliberately skipped otherwise.
+            writing_task = input_data.get("writing_task")
+            if writing_task and workflow_result["analysis_reports"]:
+                coach_task_type = (
+                    writing_task
+                    if writing_task in {"explain", "polish", "mimic", "suggest"}
+                    else "suggest"
+                )
+                coach_result = await self._run_agent("coach", {
+                    "user_id": user_id,
+                    "task_type": coach_task_type,
+                    "content": json.dumps(
+                        workflow_result["analysis_reports"],
+                        ensure_ascii=False, default=str,
+                    ),
+                    "instruction": str(writing_task),
+                }, task)
+                workflow_result["stages"]["coach"] = coach_result
+            elif writing_task:
+                workflow_result["stages"]["coach"] = {"status": "skipped"}
+                workflow_result["warnings"].append(
+                    "Coach 已跳过：没有至少一份有效的 Miner 分析"
+                )
+
+            workflow_result["stages"]["analysis"] = {
+                "policy": "BEST_EFFORT",
+                "valid_count": len(workflow_result["analysis_reports"]),
+            }
 
             workflow_result["final_papers"] = papers
 
@@ -554,7 +674,7 @@ class AgentController:
         """获取任务状态"""
         await self._ensure_initialized()
         task = await self.task_backend.get(task_id)
-        if not task:
+        if not task or not self._owned_by_request(task):
             return None
         return {
             "id": task["id"],
@@ -571,11 +691,21 @@ class AgentController:
 
     async def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         await self._ensure_initialized()
-        return await self.task_backend.get(task_id)
+        task = await self.task_backend.get(task_id)
+        return task if task and self._owned_by_request(task) else None
 
     async def list_tasks(self, limit: int = 50) -> List[Dict[str, Any]]:
         await self._ensure_initialized()
-        return await self.task_backend.list(limit)
+        identity = get_request_identity()
+        unrestricted_dev = (
+            identity.user_id == "anonymous"
+            and os.getenv("AUTH_REQUIRED", "false").lower() != "true"
+        )
+        if unrestricted_dev:
+            return await self.task_backend.list(limit)
+        return await self.task_backend.list(
+            limit, identity.tenant_id, identity.user_id
+        )
 
     async def append_task_event(self, task_id: str, event: Dict[str, Any]) -> None:
         await self._ensure_initialized()
@@ -583,10 +713,26 @@ class AgentController:
 
     async def cancel_task(self, task_id: str) -> bool:
         await self._ensure_initialized()
+        task = await self.task_backend.get(task_id)
+        if not task or not self._owned_by_request(task):
+            return False
         cancelled = await self.task_backend.cancel(task_id)
         if cancelled:
             logger.info(f"任务已取消: {task_id}")
         return cancelled
+
+    @staticmethod
+    def _owned_by_request(task: Dict[str, Any]) -> bool:
+        identity = get_request_identity()
+        if (
+            identity.user_id == "anonymous"
+            and os.getenv("AUTH_REQUIRED", "false").lower() != "true"
+        ):
+            return True
+        return (
+            task.get("tenant_id", "default") == identity.tenant_id
+            and task.get("user_id", "anonymous") == identity.user_id
+        )
 
     async def get_agent_status(self) -> Dict[str, Any]:
         await self._ensure_initialized()

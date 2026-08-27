@@ -7,9 +7,11 @@ import json
 import logging
 import time
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from datetime import datetime
 from contextvars import ContextVar
 from typing import Any, Callable, Dict, List, Optional
+from uuid import uuid4
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import Tool
@@ -36,14 +38,36 @@ class BaseAgent(ABC):
         self.max_steps = max_steps or self.config.agent_max_steps
         self.timeout = timeout or self.config.agent_timeout
 
-        self.history: List[str] = []
         self.tools: List[Tool] = []
         self.tools_dict: Dict[str, Dict] = {}
-        self.state = "idle"
         self.created_at = datetime.now()
+        # Singleton agent definitions are safe to share; execution state is not.
+        self._history_var = ContextVar(f"{name}_history", default=None)
+        self._state_var = ContextVar(f"{name}_state", default="idle")
+        self._active_executions = 0
+        self._active_lock = asyncio.Lock()
 
-        self.checkpointer = InMemorySaver()
-        self.agent_graph = None
+    def _history(self) -> List[str]:
+        history = self._history_var.get()
+        if history is None:
+            history = []
+            self._history_var.set(history)
+        return history
+
+    @asynccontextmanager
+    async def execution_scope(self, execution_id: str = ""):
+        """Isolate mutable history/state for one concurrent invocation."""
+        history_token = self._history_var.set([])
+        state_token = self._state_var.set("running")
+        async with self._active_lock:
+            self._active_executions += 1
+        try:
+            yield execution_id or uuid4().hex
+        finally:
+            async with self._active_lock:
+                self._active_executions -= 1
+            self._state_var.reset(state_token)
+            self._history_var.reset(history_token)
 
     @abstractmethod
     async def run(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -101,8 +125,9 @@ class BaseAgent(ABC):
                 ctx_str = json.dumps(context, ensure_ascii=False, indent=2)
                 full_prompt = f"上下文信息:\n{ctx_str}\n\n任务:\n{prompt}"
 
-            if self.history:
-                history_str = "\n".join(self.history[-10:])
+            history = self._history()
+            if history:
+                history_str = "\n".join(history[-10:])
                 full_prompt += f"\n\n历史记录:\n{history_str}"
 
             messages.append(HumanMessage(content=full_prompt))
@@ -131,32 +156,30 @@ class BaseAgent(ABC):
             llm = self.llm.llm if hasattr(self.llm, 'llm') else self.llm
             prompt = system_prompt or self._get_system_prompt()
 
-            self.agent_graph = create_react_agent(
+            agent_graph = create_react_agent(
                 model=llm,
                 tools=self.tools,
                 prompt=prompt,
-                checkpointer=self.checkpointer,
+                checkpointer=InMemorySaver(),
             )
             logger.info(f"Agent {self.name} LangGraph ReAct Agent 构建成功 (工具数: {len(self.tools)})")
-            return self.agent_graph
+            return agent_graph
         except Exception as e:
             logger.error(f"构建 Agent 失败: {str(e)}")
             return None
 
-    async def run_with_tools(self, input_text: str, thread_id: str = "default") -> str:
+    async def run_with_tools(self, input_text: str, thread_id: str = None) -> str:
         """使用 LangGraph ReAct Agent 执行任务，LLM 自主决策工具调用"""
-        if not self.agent_graph:
-            self._build_agent_graph()
-
-        if not self.agent_graph:
+        agent_graph = self._build_agent_graph()
+        if not agent_graph:
             return await self.think(input_text)
 
         try:
-            config = {"configurable": {"thread_id": thread_id}}
+            config = {"configurable": {"thread_id": thread_id or uuid4().hex}}
             messages = [HumanMessage(content=input_text)]
 
             result = await asyncio.wait_for(
-                asyncio.to_thread(self.agent_graph.invoke, {"messages": messages}, config),
+                asyncio.to_thread(agent_graph.invoke, {"messages": messages}, config),
                 timeout=self.timeout,
             )
 
@@ -176,19 +199,19 @@ class BaseAgent(ABC):
 
     def _add_to_history(self, message: str):
         timestamp = datetime.now().isoformat()
-        self.history.append(f"[{timestamp}] {message}")
-        if len(self.history) > 100:
-            self.history = self.history[-50:]
+        history = self._history()
+        history.append(f"[{timestamp}] {message}")
+        if len(history) > 100:
+            del history[:-50]
 
     def get_history(self, limit: int = 10) -> List[str]:
-        return self.history[-limit:]
+        return self._history()[-limit:]
 
     def clear_history(self):
-        self.history = []
-        self.checkpointer = InMemorySaver()
+        self._history_var.set([])
 
     def set_state(self, state: str):
-        self.state = state
+        self._state_var.set(state)
         logger.info(f"Agent {self.name} state: {state}")
 
     async def emit_progress(self, stage: str, message: str, **data):
@@ -207,9 +230,10 @@ class BaseAgent(ABC):
     def get_status(self) -> Dict[str, Any]:
         return {
             "name": self.name,
-            "state": self.state,
+            "state": "running" if self._active_executions else self._state_var.get(),
             "created_at": self.created_at.isoformat(),
-            "history_count": len(self.history),
+            "history_count": len(self._history()),
+            "active_executions": self._active_executions,
             "tools_count": len(self.tools),
             "max_steps": self.max_steps,
             "timeout": self.timeout,
@@ -227,7 +251,7 @@ class BaseAgent(ABC):
         pass
 
     def __str__(self) -> str:
-        return f"{self.__class__.__name__}(name='{self.name}', state='{self.state}')"
+        return f"{self.__class__.__name__}(name='{self.name}', state='{self._state_var.get()}')"
 
     def __repr__(self) -> str:
         return self.__str__()

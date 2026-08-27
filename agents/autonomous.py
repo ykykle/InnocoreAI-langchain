@@ -36,8 +36,12 @@ ProgressCallback = Callable[[str, str, Dict[str, Any]], Awaitable[None]]
 class AutonomousResearchGraph:
     """ReAct supervisor that delegates work to modular specialist agents."""
 
-    def __init__(self, agents: Dict[str, Any]):
+    def __init__(
+        self, agents: Dict[str, Any],
+        agent_runner: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+    ):
         self.agents = agents
+        self.agent_runner = agent_runner
         self.checkpointer = InMemorySaver()
 
     async def run(
@@ -103,7 +107,11 @@ class AutonomousResearchGraph:
                 agent = self.agents[name]
                 token = agent.set_progress_callback(specialist_progress)
                 try:
-                    result = await asyncio.wait_for(agent.run(payload), timeout=agent.timeout)
+                    invocation = (
+                        self.agent_runner(name, payload)
+                        if self.agent_runner else agent.run(payload)
+                    )
+                    result = await asyncio.wait_for(invocation, timeout=agent.timeout)
                     if name == "hunter":
                         for paper in result.get("papers", []):
                             evidence_id = str(paper.get("external_id") or paper.get("id") or paper.get("doi") or "")

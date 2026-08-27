@@ -84,7 +84,7 @@ class RedisConfig:
 
 @dataclass
 class TaskQueueConfig:
-    """任务调度配置。local 用于单实例，redis 用于多实例。"""
+    """任务调度配置。local 用于开发，redis_stream 用于多实例生产。"""
     backend: str = "local"
     worker_enabled: bool = True
     instance_id: Optional[str] = None
@@ -97,6 +97,14 @@ class TaskQueueConfig:
     history_maxlen: int = 1000
     wait_timeout: int = 600
     poll_interval_ms: int = 200
+    stream_name: str = "agent_tasks"
+    consumer_group: str = "agent_workers"
+    stream_maxlen: int = 10000
+    stream_block_ms: int = 1000
+    stream_claim_idle_ms: int = 300000
+    outbox_batch_size: int = 100
+    user_concurrency: int = 2
+    miner_concurrency: int = 4
 
 @dataclass
 class ExternalAPIConfig:
@@ -230,8 +238,11 @@ class InnoCoreConfig:
         self.task_queue.backend = os.getenv(
             "TASK_QUEUE_BACKEND", self.task_queue.backend
         ).lower()
-        if self.task_queue.backend not in {"local", "redis"}:
-            raise ValueError("TASK_QUEUE_BACKEND 必须是 local 或 redis")
+        # redis 作为旧配置名兼容，实际已切换为 PostgreSQL + Redis Stream。
+        if self.task_queue.backend == "redis":
+            self.task_queue.backend = "redis_stream"
+        if self.task_queue.backend not in {"local", "redis_stream"}:
+            raise ValueError("TASK_QUEUE_BACKEND 必须是 local 或 redis_stream")
         self.task_queue.worker_enabled = os.getenv(
             "TASK_WORKER_ENABLED", str(self.task_queue.worker_enabled)
         ).lower() == "true"
@@ -250,12 +261,24 @@ class InnoCoreConfig:
             ("TASK_HISTORY_MAXLEN", "history_maxlen"),
             ("TASK_WAIT_TIMEOUT", "wait_timeout"),
             ("TASK_POLL_INTERVAL_MS", "poll_interval_ms"),
+            ("TASK_STREAM_MAXLEN", "stream_maxlen"),
+            ("TASK_STREAM_BLOCK_MS", "stream_block_ms"),
+            ("TASK_STREAM_CLAIM_IDLE_MS", "stream_claim_idle_ms"),
+            ("TASK_OUTBOX_BATCH_SIZE", "outbox_batch_size"),
+            ("TASK_USER_CONCURRENCY", "user_concurrency"),
+            ("TASK_MINER_CONCURRENCY", "miner_concurrency"),
         ):
             setattr(
                 self.task_queue,
                 attr,
                 int(os.getenv(env_name, str(getattr(self.task_queue, attr)))),
             )
+        self.task_queue.stream_name = os.getenv(
+            "TASK_STREAM_NAME", self.task_queue.stream_name
+        )
+        self.task_queue.consumer_group = os.getenv(
+            "TASK_CONSUMER_GROUP", self.task_queue.consumer_group
+        )
         if self.task_queue.heartbeat_seconds >= self.task_queue.lease_seconds:
             raise ValueError("TASK_HEARTBEAT_SECONDS 必须小于 TASK_LEASE_SECONDS")
         

@@ -5,11 +5,11 @@
 验证以下行为：
 
 1. 默认 `local` 模式不依赖 Redis，单实例功能保持正常。
-2. `redis` 模式下所有实例共享任务状态，同一任务只能被一个 Worker 认领。
+2. `redis_stream` 模式下所有实例共享任务状态，同一任务只能被一个 Worker 认领。
 3. Worker 异常退出后，任务租约到期可被其他 Worker 恢复。
 4. 同步业务接口保持原响应方式，异步任务接口继续返回任务 ID。
 5. `/api/v1/agent/runs` 使用统一任务后端，不再依赖单进程内存。
-6. Redis 不可用时，`redis` 模式启动失败，不静默降级。
+6. Redis 或 PostgreSQL 不可用时，`redis_stream` 模式启动失败，不静默降级。
 
 ## 2. 调度模式
 
@@ -25,7 +25,7 @@ TASK_WORKER_ENABLED=true
 ### 多实例模式
 
 ```env
-TASK_QUEUE_BACKEND=redis
+TASK_QUEUE_BACKEND=redis_stream
 TASK_WORKER_ENABLED=true
 TASK_QUEUE_KEY_PREFIX=innocore:acceptance
 REDIS_HOST=localhost
@@ -33,7 +33,7 @@ REDIS_PORT=6379
 REDIS_DB=0
 ```
 
-Redis 是唯一任务源。每个实例可以同时提供 API 和消费任务。
+PostgreSQL 是唯一状态真相源，Redis Stream 是任务投递通道。每个实例可以同时提供 API 和消费任务。
 
 调度语义是 **at-least-once**：租约和 fencing token 保证同一时刻只有一个
 有效持有者可以提交最终结果，但 Worker 在外部副作用完成后、提交结果前崩溃时，
@@ -44,11 +44,11 @@ Redis 是唯一任务源。每个实例可以同时提供 API 和消费任务。
 
 ```env
 # API 实例
-TASK_QUEUE_BACKEND=redis
+TASK_QUEUE_BACKEND=redis_stream
 TASK_WORKER_ENABLED=false
 
 # Worker 实例
-TASK_QUEUE_BACKEND=redis
+TASK_QUEUE_BACKEND=redis_stream
 TASK_WORKER_ENABLED=true
 ```
 
@@ -63,12 +63,12 @@ TASK_WORKER_ENABLED=true
 python -m unittest tests.test_task_queue -v
 ```
 
-预期：8 项测试全部通过，覆盖模式配置、优先级、唯一认领、fencing token、
-重试、取消、事件和结果读取。
+预期：10 项测试全部通过，覆盖模式配置、优先级、用户并发限制、唯一认领、
+fencing token、重试、取消、事件和结果读取。
 
 ### 3.2 Redis 集成测试
 
-先启动专用测试 Redis，禁止使用包含生产数据的实例：
+先启动专用测试 PostgreSQL 与 Redis，禁止使用包含生产数据的实例：
 
 ```bash
 docker run --rm -d \
@@ -81,12 +81,12 @@ docker run --rm -d \
 运行：
 
 ```bash
-RUN_REDIS_INTEGRATION=1 \
+RUN_DISTRIBUTED_INTEGRATION=1 \
 REDIS_TEST_PORT=6389 \
 python -m unittest tests.test_redis_task_queue_integration -v
 ```
 
-预期：5 项测试全部通过。测试使用随机 `innocore:test:*` 前缀并在结束时清理。
+预期：3 项测试全部通过。测试使用随机 tenant/Stream 前缀并在结束时清理。
 
 ```bash
 docker stop innocore-redis-acceptance
@@ -157,14 +157,14 @@ docker compose ps redis
 分别启动两个实例：
 
 ```bash
-TASK_QUEUE_BACKEND=redis \
+TASK_QUEUE_BACKEND=redis_stream \
 TASK_QUEUE_KEY_PREFIX=innocore:acceptance \
 INSTANCE_ID=api-1 \
 uvicorn api.main:app --host 127.0.0.1 --port 8001
 ```
 
 ```bash
-TASK_QUEUE_BACKEND=redis \
+TASK_QUEUE_BACKEND=redis_stream \
 TASK_QUEUE_KEY_PREFIX=innocore:acceptance \
 INSTANCE_ID=api-2 \
 uvicorn api.main:app --host 127.0.0.1 --port 8002
@@ -204,14 +204,14 @@ curl -s http://127.0.0.1:8002/api/v1/tasks/TASK_ID/status
 检查 Redis：
 
 ```bash
-redis-cli ZCARD innocore:acceptance:tasks:pending
-redis-cli ZCARD innocore:acceptance:tasks:processing
-redis-cli XRANGE innocore:acceptance:tasks:history - +
-redis-cli HGETALL innocore:acceptance:task:TASK_ID
+redis-cli XINFO GROUPS innocore:acceptance:agent_tasks
+redis-cli XPENDING innocore:acceptance:agent_tasks agent_workers
+psql -d innocore_ai -c "select id,status,owner,retry_count,version from agent_tasks where id='TASK_ID';"
+psql -d innocore_ai -c "select version,event_type,from_status,to_status from agent_task_events where task_id='TASK_ID' order by version;"
 ```
 
-任务完成后，pending 和 processing 均应不包含该任务；history 中只有一条
-对应的 terminal 事件。
+任务完成后，consumer group 不应残留该任务的 pending delivery；PostgreSQL
+状态为 `completed`，且事件表存在连续、唯一的状态版本。
 
 ## 6. Worker 故障恢复
 
@@ -223,7 +223,7 @@ redis-cli HGETALL innocore:acceptance:task:TASK_ID
 
 预期：
 
-- 任务被重新放入 pending。
+- pending delivery 被其他 consumer 接管，PostgreSQL 任务重新进入 `running`。
 - `retry_count` 增加 1。
 - `owner` 变为新的 Worker。
 - 旧 Worker 即使恢复，也因 lease token 不匹配而无法提交结果。
@@ -240,7 +240,7 @@ TASK_HEARTBEAT_SECONDS=2
 停止 Redis 后执行：
 
 ```bash
-TASK_QUEUE_BACKEND=redis \
+TASK_QUEUE_BACKEND=redis_stream \
 REDIS_PORT=6399 \
 uvicorn api.main:app --host 127.0.0.1 --port 8010
 ```

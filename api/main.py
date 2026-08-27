@@ -2,7 +2,7 @@
 InnoCore API 主应用
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
@@ -11,6 +11,7 @@ import sys
 import uvicorn
 
 from core.config import get_config
+from core.request_context import reset_request_identity, set_request_identity
 from core.database import db_manager
 from core.vector_store import vector_store_manager
 from agents.controller import agent_controller
@@ -81,7 +82,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"向量存储初始化失败（将以无向量存储模式运行）: {str(e)}")
 
-    # 初始化智能体控制器。local 模式不依赖 Redis；redis 模式连接失败时拒绝启动。
+    # local 不依赖 Redis；redis_stream 模式任一基础设施不可用都拒绝启动。
     try:
         await agent_controller.initialize()
         logger.info("智能体控制器初始化完成")
@@ -91,7 +92,7 @@ async def lifespan(app: FastAPI):
             agent_controller.start_task_processor()
         )
     except Exception as e:
-        if get_config().task_queue.backend == "redis":
+        if get_config().task_queue.backend == "redis_stream":
             logger.exception("Redis 分布式任务调度初始化失败")
             raise
         logger.warning(f"智能体控制器初始化失败: {str(e)}")
@@ -122,6 +123,28 @@ app = FastAPI(
 
 # 配置CORS
 config = get_config()
+
+@app.middleware("http")
+async def bind_request_identity(request: Request, call_next):
+    """Bind identity asserted by the trusted authentication gateway."""
+    tenant_id = request.headers.get("X-Tenant-ID", "default").strip()
+    user_id = request.headers.get("X-User-ID", "anonymous").strip()
+    if (
+        request.url.path.startswith("/api/")
+        and os.getenv("AUTH_REQUIRED", "false").lower() == "true"
+        and (
+        not request.headers.get("X-Tenant-ID") or not request.headers.get("X-User-ID")
+        )
+    ):
+        return JSONResponse(
+            status_code=401, content={"detail": "missing tenant/user identity"}
+        )
+    token = set_request_identity(tenant_id or "default", user_id or "anonymous")
+    try:
+        return await call_next(request)
+    finally:
+        reset_request_identity(token)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # 生产环境应该限制具体域名

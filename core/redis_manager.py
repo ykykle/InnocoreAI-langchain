@@ -75,7 +75,7 @@ class RedisManager:
         if not self.redis:
             raise RuntimeError("Redis 未初始化或不可用")
 
-    # ---- 任务队列 (Sorted Set，score=-priority 实现优先级) ----
+    # ---- 旧版 Sorted Set 辅助方法（新任务调度使用 Redis Stream） ----
     async def push_task(self, queue: str, task_id: str, priority: int = 0) -> None:
         self._ensure_redis()
         await self.redis.zadd(queue, {task_id: -priority})

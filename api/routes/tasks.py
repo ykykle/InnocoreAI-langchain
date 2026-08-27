@@ -8,8 +8,10 @@ from pydantic import BaseModel
 import logging
 import json
 import asyncio
+import os
 
 from agents.controller import agent_controller, TaskType
+from core.request_context import reset_request_identity, set_request_identity
 # 临时注释，避免相对导入错误
 # agent_controller = None
 # TaskType = None
@@ -59,6 +61,17 @@ class ConnectionManager:
                 self.active_connections.remove(connection)
 
 manager = ConnectionManager()
+
+
+async def _bind_websocket_identity(websocket: WebSocket):
+    tenant_id = websocket.headers.get("X-Tenant-ID")
+    user_id = websocket.headers.get("X-User-ID")
+    if os.getenv("AUTH_REQUIRED", "false").lower() == "true" and (
+        not tenant_id or not user_id
+    ):
+        await websocket.close(code=4401)
+        return None
+    return set_request_identity(tenant_id or "default", user_id or "anonymous")
 
 @router.post("/submit", response_model=Dict[str, Any], status_code=202)
 async def submit_task(request: TaskSubmitRequest):
@@ -203,6 +216,9 @@ async def run_full_workflow(input_data: Dict[str, Any]):
 @router.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
     """WebSocket流式通信（用于写作助教等实时交互）"""
+    identity_token = await _bind_websocket_identity(websocket)
+    if identity_token is None:
+        return
     await manager.connect(websocket)
     try:
         while True:
@@ -226,11 +242,16 @@ async def websocket_stream(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket流式通信异常: {str(e)}")
         manager.disconnect(websocket)
+    finally:
+        reset_request_identity(identity_token)
 
 
 @router.websocket("/ws/{task_id}")
 async def websocket_task_updates(websocket: WebSocket, task_id: str):
     """WebSocket任务更新"""
+    identity_token = await _bind_websocket_identity(websocket)
+    if identity_token is None:
+        return
     await manager.connect(websocket)
     try:
         status = await agent_controller.get_task_status(task_id)
@@ -256,6 +277,8 @@ async def websocket_task_updates(websocket: WebSocket, task_id: str):
     except Exception as e:
         logger.error(f"WebSocket连接异常: {str(e)}")
         manager.disconnect(websocket)
+    finally:
+        reset_request_identity(identity_token)
 
 
 async def handle_writing_assistance(websocket: WebSocket, data: Dict[str, Any]):

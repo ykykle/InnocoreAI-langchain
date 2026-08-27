@@ -11,6 +11,9 @@ def make_task(task_id: str, priority: int = 0, max_retries: int = 1):
     return {
         "id": task_id,
         "type": "paper_analysis",
+        "agent_type": "miner",
+        "tenant_id": "test-tenant",
+        "user_id": "test-user",
         "input_data": {"paper_id": task_id},
         "status": "pending",
         "priority": priority,
@@ -51,6 +54,23 @@ class MemoryTaskQueueBackendTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(sum(value is not None for value in (first, second)), 1)
+
+    async def test_per_user_admission_limit(self):
+        config = get_config().task_queue
+        original = config.user_concurrency
+        config.user_concurrency = 2
+        try:
+            for task_id in ("user-1", "user-2", "user-3"):
+                await self.backend.submit(make_task(task_id))
+            first = await self.backend.claim_next("worker-a")
+            second = await self.backend.claim_next("worker-b")
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(second)
+            self.assertIsNone(await self.backend.claim_next("worker-c"))
+            await self.backend.complete(first[0]["id"], "worker-a", first[1], {})
+            self.assertIsNotNone(await self.backend.claim_next("worker-c"))
+        finally:
+            config.user_concurrency = original
 
     async def test_fencing_token_rejects_stale_completion(self):
         await self.backend.submit(make_task("fenced"))
@@ -117,7 +137,7 @@ class MemoryTaskQueueBackendTest(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, environment, clear=False):
             config = InnoCoreConfig()
 
-        self.assertEqual(config.task_queue.backend, "redis")
+        self.assertEqual(config.task_queue.backend, "redis_stream")
         self.assertFalse(config.task_queue.worker_enabled)
         self.assertEqual(config.task_queue.key_prefix, "innocore:test-env")
         self.assertEqual(config.redis.host, "redis.internal")

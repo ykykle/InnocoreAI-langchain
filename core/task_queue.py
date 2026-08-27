@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from .config import get_config
 from .redis_manager import redis_manager
+from .task_store import postgres_task_store
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,10 @@ class TaskQueueBackend(ABC):
         pass
 
     @abstractmethod
-    async def list(self, limit: int = 50) -> List[Dict[str, Any]]:
+    async def list(
+        self, limit: int = 50, tenant_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         pass
 
     @abstractmethod
@@ -113,6 +117,23 @@ class MemoryTaskQueueBackend(TaskQueueBackend):
         task = self._tasks.get(task_id)
         if not task or task["status"] != "pending":
             return None
+        queue_config = get_config().task_queue
+        active_user = sum(
+            1 for item in self._tasks.values()
+            if item.get("status") == "running"
+            and item.get("tenant_id", "default") == task.get("tenant_id", "default")
+            and item.get("user_id", "anonymous") == task.get("user_id", "anonymous")
+        )
+        if active_user >= queue_config.user_concurrency:
+            return None
+        if task.get("agent_type") == "miner":
+            active_miner = sum(
+                1 for item in self._tasks.values()
+                if item.get("status") == "running"
+                and item.get("agent_type") == "miner"
+            )
+            if active_miner >= queue_config.miner_concurrency:
+                return None
         lease_token = uuid4().hex
         task.update(
             status="running",
@@ -126,17 +147,31 @@ class MemoryTaskQueueBackend(TaskQueueBackend):
 
     async def claim_next(self, worker_id: str) -> Optional[Tuple[Dict[str, Any], str]]:
         poll_seconds = get_config().task_queue.poll_interval_ms / 1000
-        while True:
+        try:
+            first = await asyncio.wait_for(self._queue.get(), timeout=poll_seconds)
+        except asyncio.TimeoutError:
+            return None
+        entries = [first]
+        for _ in range(self._queue.qsize()):
             try:
-                _, _, task_id = await asyncio.wait_for(
-                    self._queue.get(), timeout=poll_seconds
-                )
-            except asyncio.TimeoutError:
-                return None
+                entries.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        deferred = []
+        for index, entry in enumerate(entries):
+            _, _, task_id = entry
             async with self._lock:
                 claimed = self._claim_locked(task_id, worker_id)
+                blocked = self._tasks.get(task_id, {}).get("status") == "pending"
             if claimed:
+                for queued in deferred + entries[index + 1:]:
+                    await self._queue.put(queued)
                 return claimed
+            if blocked:
+                deferred.append(entry)
+        for entry in deferred:
+            await self._queue.put(entry)
+        return None
 
     async def claim_task(
         self, task_id: str, worker_id: str
@@ -234,10 +269,18 @@ class MemoryTaskQueueBackend(TaskQueueBackend):
             task = self._tasks.get(task_id)
             return deepcopy(task) if task else None
 
-    async def list(self, limit: int = 50) -> List[Dict[str, Any]]:
+    async def list(
+        self, limit: int = 50, tenant_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         async with self._lock:
             tasks = sorted(
-                self._tasks.values(), key=lambda item: item["created_at"], reverse=True
+                (
+                    item for item in self._tasks.values()
+                    if (tenant_id is None or item.get("tenant_id", "default") == tenant_id)
+                    and (user_id is None or item.get("user_id", "anonymous") == user_id)
+                ),
+                key=lambda item: item["created_at"], reverse=True,
             )
             return deepcopy(tasks[:limit])
 
@@ -272,7 +315,7 @@ class MemoryTaskQueueBackend(TaskQueueBackend):
             self._tasks.pop(task["id"], None)
 
 
-class RedisTaskQueueBackend(TaskQueueBackend):
+class LegacyRedisTaskQueueBackend(TaskQueueBackend):
     """Redis-backed priority queue with leases and fencing tokens."""
 
     name = "redis"
@@ -689,7 +732,10 @@ return reclaimed
     async def get(self, task_id: str) -> Optional[Dict[str, Any]]:
         return await self._decode_task(task_id)
 
-    async def list(self, limit: int = 50) -> List[Dict[str, Any]]:
+    async def list(
+        self, limit: int = 50, tenant_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         task_ids = await self.redis.zrevrange(self.index_key, 0, max(limit * 2, 20))
         if not task_ids:
             return []
@@ -702,6 +748,10 @@ return reclaimed
         for task_id, task_data in zip(task_ids, task_rows):
             task = self._decode_mapping(task_data)
             if task:
+                if tenant_id is not None and task.get("tenant_id", "default") != tenant_id:
+                    continue
+                if user_id is not None and task.get("user_id", "anonymous") != user_id:
+                    continue
                 tasks.append(task)
                 if len(tasks) >= limit:
                     break
@@ -739,10 +789,220 @@ return reclaimed
         await redis_manager.close()
 
 
+class RedisTaskQueueBackend(TaskQueueBackend):
+    """Redis Stream transport backed by PostgreSQL's durable state machine.
+
+    A Stream entry is only a delivery notification. PostgreSQL owns status,
+    retries, leases, cancellation, results and the transition audit trail.
+    Consumer-group pending entries plus fencing tokens provide at-least-once
+    delivery without allowing stale workers to commit results.
+    """
+
+    name = "redis_stream"
+
+    def __init__(self) -> None:
+        self.config = get_config().task_queue
+        prefix = self.config.key_prefix.rstrip(":")
+        self.stream_key = f"{prefix}:{self.config.stream_name}"
+        self.group = self.config.consumer_group
+        self.worker_key = f"{prefix}:workers"
+        self.publisher_id = f"publisher:{uuid4().hex}"
+        self.redis = None
+        self._worker_heartbeats: Dict[str, float] = {}
+
+    async def initialize(self) -> None:
+        await postgres_task_store.initialize()
+        await redis_manager.initialize()
+        self.redis = redis_manager.redis
+        if self.redis is None:
+            raise RuntimeError("Redis client is unavailable")
+        try:
+            await self.redis.xgroup_create(
+                self.stream_key, self.group, id="0-0", mkstream=True
+            )
+        except Exception as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+        await self._publish_outbox()
+
+    async def _publish_outbox(self) -> None:
+        rows = await postgres_task_store.claim_outbox(
+            self.publisher_id, self.config.outbox_batch_size
+        )
+        for row in rows:
+            try:
+                raw_payload = row.get("payload") or {}
+                payload = (
+                    json.loads(raw_payload)
+                    if isinstance(raw_payload, str) else dict(raw_payload)
+                )
+                # Never MAXLEN-trim a work queue: Redis may evict an entry that
+                # is still pending for a consumer. Maintenance can trim only
+                # entries known to be acknowledged by the whole group.
+                await self.redis.xadd(
+                    row["topic"],
+                    {key: str(value) for key, value in payload.items()},
+                )
+                await postgres_task_store.mark_outbox_published(row["id"])
+            except Exception:
+                await postgres_task_store.release_outbox(row["id"])
+                raise
+
+    async def submit(self, task: Dict[str, Any]) -> None:
+        await postgres_task_store.create(task, self.stream_key)
+        await self._publish_outbox()
+
+    async def _read_messages(self, worker_id: str) -> List[Tuple[str, Dict[str, str]]]:
+        # First rescue deliveries abandoned by dead workers.
+        try:
+            claimed = await self.redis.xautoclaim(
+                self.stream_key,
+                self.group,
+                worker_id,
+                min_idle_time=self.config.stream_claim_idle_ms,
+                start_id="0-0",
+                count=1,
+            )
+            if claimed and len(claimed) >= 2 and claimed[1]:
+                return list(claimed[1])
+        except Exception as exc:
+            # Redis < 6.2 has no XAUTOCLAIM; new messages remain usable.
+            logger.debug("XAUTOCLAIM unavailable: %s", exc)
+        rows = await self.redis.xreadgroup(
+            self.group,
+            worker_id,
+            {self.stream_key: ">"},
+            count=1,
+            block=self.config.stream_block_ms,
+        )
+        return list(rows[0][1]) if rows else []
+
+    async def claim_next(self, worker_id: str) -> Optional[Tuple[Dict[str, Any], str]]:
+        await self._publish_outbox()
+        for message_id, fields in await self._read_messages(worker_id):
+            task_id = fields.get("task_id")
+            if not task_id:
+                await self.redis.xack(self.stream_key, self.group, message_id)
+                continue
+            token = uuid4().hex
+            task = await postgres_task_store.claim(
+                task_id, worker_id, token, message_id,
+                self.config.lease_seconds,
+                self.config.user_concurrency,
+                self.config.miner_concurrency,
+            )
+            if task:
+                return task, token
+            current = await postgres_task_store.get(task_id, include_events=False)
+            should_ack = current is None or current["status"] in TERMINAL_STATUSES
+            if current and current["status"] in {"pending", "retry_wait"}:
+                next_run = current.get("next_run_at")
+                not_ready = bool(
+                    next_run
+                    and datetime.fromisoformat(next_run) > datetime.now(timezone.utc)
+                )
+                if not not_ready:
+                    await postgres_task_store.defer_dispatch(
+                        task_id, self.stream_key,
+                        max(0.2, self.config.poll_interval_ms / 1000),
+                    )
+                # A durable future dispatch now exists (or already existed).
+                should_ack = True
+            # A still-running task retains its pending Stream entry. Otherwise
+            # a long task could be XAUTOCLAIMed, ACKed and then become
+            # unrecoverable if its original worker crashes.
+            if should_ack:
+                await self.redis.xack(self.stream_key, self.group, message_id)
+        return None
+
+    async def claim_task(
+        self, task_id: str, worker_id: str
+    ) -> Optional[Tuple[Dict[str, Any], str]]:
+        # Distributed execution must always enter through the consumer group.
+        return None
+
+    async def heartbeat(self, task_id: str, worker_id: str, lease_token: str) -> bool:
+        return await postgres_task_store.heartbeat(
+            task_id, worker_id, lease_token, self.config.lease_seconds
+        )
+
+    async def _ack_task(self, task: Optional[Dict[str, Any]]) -> None:
+        if task and task.get("stream_message_id"):
+            await self.redis.xack(
+                self.stream_key, self.group, task["stream_message_id"]
+            )
+
+    async def complete(
+        self, task_id: str, worker_id: str, lease_token: str,
+        result: Dict[str, Any],
+    ) -> bool:
+        before = await postgres_task_store.get(task_id, include_events=False)
+        persisted = await postgres_task_store.complete(
+            task_id, worker_id, lease_token, result
+        )
+        after = await postgres_task_store.get(task_id, include_events=False)
+        if persisted or (after and after["status"] in TERMINAL_STATUSES):
+            await self._ack_task(before)
+        return persisted
+
+    async def fail(
+        self, task_id: str, worker_id: str, lease_token: str, error: str
+    ) -> str:
+        before = await postgres_task_store.get(task_id, include_events=False)
+        retry_count = int((before or {}).get("retry_count", 0))
+        delay = min(300, 5 * (2 ** retry_count))
+        outcome = await postgres_task_store.fail(
+            task_id, worker_id, lease_token, error, self.stream_key, delay
+        )
+        if outcome in {"retry", "failed", "stale", "cancelled"}:
+            await self._ack_task(before)
+        if outcome == "retry":
+            await self._publish_outbox()
+        return "retry" if outcome == "retry" else "failed"
+
+    async def cancel(self, task_id: str) -> bool:
+        before = await postgres_task_store.get(task_id, include_events=False)
+        cancelled = await postgres_task_store.cancel(task_id)
+        after = await postgres_task_store.get(task_id, include_events=False)
+        if cancelled and after and after["status"] == "cancelled":
+            await self._ack_task(before)
+        return cancelled
+
+    async def get(self, task_id: str) -> Optional[Dict[str, Any]]:
+        return await postgres_task_store.get(task_id)
+
+    async def list(
+        self, limit: int = 50, tenant_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        return await postgres_task_store.list(limit, tenant_id, user_id)
+
+    async def append_event(self, task_id: str, event: Dict[str, Any]) -> None:
+        await postgres_task_store.append_event(task_id, event)
+
+    async def queue_size(self) -> int:
+        return await postgres_task_store.queue_size()
+
+    async def heartbeat_worker(self, worker_id: str) -> None:
+        now = time.monotonic()
+        if now - self._worker_heartbeats.get(worker_id, 0.0) < self.config.heartbeat_seconds:
+            return
+        await self.redis.set(
+            f"{self.worker_key}:{worker_id}", time.time(),
+            ex=max(self.config.lease_seconds * 2, 60),
+        )
+        self._worker_heartbeats[worker_id] = now
+
+    async def close(self) -> None:
+        await redis_manager.close()
+
+
 def create_task_backend() -> TaskQueueBackend:
     backend = get_config().task_queue.backend
     if backend == "local":
         return MemoryTaskQueueBackend()
-    if backend == "redis":
+    if backend == "redis_stream":
         return RedisTaskQueueBackend()
-    raise ValueError(f"Unsupported TASK_QUEUE_BACKEND={backend!r}; use local or redis")
+    raise ValueError(
+        f"Unsupported TASK_QUEUE_BACKEND={backend!r}; use local or redis_stream"
+    )
